@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Workflows – Session Manager & Tab Saver",
+  "short_name": "Tab Workflows",
+  "version": "1.0.0",
+  "description": "Save your tabs as named workflows and switch between them in one click. Autosaves sessions, keeps tab order and tab groups.",
+  "minimum_chrome_version": "104",
+  "permissions": [
+    "tabs",
+    "storage",
+    "favicon",
+    "tabGroups",
+    "alarms",
+    "unlimitedStorage"
+  ],
+  "optional_permissions": [
+    "downloads"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Tab Workflows",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+K",
+        "mac": "Command+Shift+K"
+      },
+      "description": "Open Tab Workflows"
+    }
+  },
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ]
+}

@@ -1,0 +1,45 @@
+/* Command palette (Ctrl+K) – Session Manager */
+.palette-backdrop {
+  position: fixed; inset: 0; z-index: 90; display: flex; justify-content: center; align-items: flex-start;
+  padding: 12vh 16px 16px; background: rgba(0, 0, 0, .35); animation: pal-fade .12s ease-out;
+}
+@keyframes pal-fade { from { opacity: 0; } }
+.palette {
+  width: 620px; max-width: 100%; max-height: 70vh; display: flex; flex-direction: column; overflow: hidden;
+  background: var(--surface); color: var(--fg); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg);
+  animation: pal-pop .14s ease-out;
+}
+@keyframes pal-pop { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+.palette-input { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); color: var(--muted); }
+.palette-input input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; color: var(--fg); font: inherit; font-size: 16px; }
+.palette kbd {
+  font: 11px/1 "Segoe UI", system-ui, sans-serif; padding: 3px 6px; border: 1px solid var(--border); border-radius: 5px;
+  color: var(--faint); background: var(--bg);
+}
+.palette-results { overflow-y: auto; padding: 6px; }
+.palette-group { font-size: 10.5px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); padding: 10px 10px 4px; }
+.palette-item { display: flex; align-items: center; gap: 11px; padding: 8px 10px; border-radius: 10px; cursor: pointer; }
+.palette-item.on { background: var(--hover); }
+.pi-icon { width: 30px; height: 30px; flex: none; border-radius: 8px; background: var(--tile); display: grid; place-items: center; color: var(--muted); position: relative; }
+.pi-icon img { width: 16px; height: 16px; border-radius: 3px; }
+.pi-icon[data-color]::after { content: ""; position: absolute; right: -2px; bottom: -2px; width: 9px; height: 9px; border-radius: 50%; border: 2px solid var(--surface); background: var(--wf-color); }
+.pi-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.pi-title { font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pi-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pi-hint { font-size: 11.5px; font-weight: 600; color: var(--muted); padding: 2px 8px; border-radius: 6px; border: 1px solid var(--border); }
+.palette-item.on .pi-hint { color: var(--fg); border-color: var(--primary); }
+.palette-empty { padding: 22px 12px; text-align: center; color: var(--muted); font-size: 13px; }
+.palette-empty.small { padding: 10px 12px 8px; font-size: 12px; color: var(--faint); }
+.palette-foot { display: flex; gap: 14px; padding: 8px 14px; border-top: 1px solid var(--border); font-size: 11.5px; color: var(--faint); }
+.palette-foot span { display: inline-flex; align-items: center; gap: 4px; }
+
+/* workflow colour labels (shared by cards, popup and palette) */
+[data-color="red"]    { --wf-color: #e5484d; }
+[data-color="orange"] { --wf-color: #f76b15; }
+[data-color="yellow"] { --wf-color: #e2a336; }
+[data-color="green"]  { --wf-color: #30a46c; }
+[data-color="teal"]   { --wf-color: #12a594; }
+[data-color="blue"]   { --wf-color: #3e63dd; }
+[data-color="purple"] { --wf-color: #8e4ec6; }
+[data-color="pink"]   { --wf-color: #d6409f; }
+[data-color="grey"]   { --wf-color: #8b8d98; }

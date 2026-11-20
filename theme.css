@@ -1,0 +1,90 @@
+/* Shared design tokens for popup + manager. Theme: html[data-theme=light|dark], none = follow system. */
+:root {
+  color-scheme: light;
+  --bg: #f6f6f7;
+  --surface: #ffffff;
+  --surface-2: #fbfbfc;
+  --fg: #141416;
+  --muted: #6e6e76;
+  --faint: #a3a3aa;
+  --border: #e5e5e9;
+  --hover: #f0f0f2;
+  --primary: #141416;
+  --primary-fg: #ffffff;
+  --tile: #f0f0f2;
+  --danger: #d4372c;
+  --ok: #1f9d55;
+  --scroll-thumb: rgba(20, 20, 22, .38);
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 2px 8px rgba(0,0,0,.04);
+  --shadow-lg: 0 10px 30px rgba(0,0,0,.12), 0 2px 6px rgba(0,0,0,.06);
+  --mark: rgba(255, 196, 0, .35);
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121214;
+  --surface: #1c1c1f;
+  --surface-2: #19191c;
+  --fg: #f1f1f3;
+  --muted: #9b9ba3;
+  --faint: #66666e;
+  --border: #2b2b30;
+  --hover: #26262a;
+  --primary: #f1f1f3;
+  --primary-fg: #141416;
+  --tile: #2a2a2f;
+  --danger: #ff6a5f;
+  --ok: #3ccf7f;
+  --scroll-thumb: #3a3a40;
+  --shadow: none;
+  --shadow-lg: 0 12px 34px rgba(0,0,0,.5);
+  --mark: rgba(255, 196, 0, .28);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121214;
+    --surface: #1c1c1f;
+    --surface-2: #19191c;
+    --fg: #f1f1f3;
+    --muted: #9b9ba3;
+    --faint: #66666e;
+    --border: #2b2b30;
+    --hover: #26262a;
+    --primary: #f1f1f3;
+    --primary-fg: #141416;
+    --tile: #2a2a2f;
+    --danger: #ff6a5f;
+    --ok: #3ccf7f;
+    --scroll-thumb: #3a3a40;
+    --shadow: none;
+    --shadow-lg: 0 12px 34px rgba(0,0,0,.5);
+    --mark: rgba(255, 196, 0, .28);
+  }
+}
+
+/* accent colours (mono = black/white default) */
+:root[data-accent="blue"]   { --primary: #3466f6; --primary-fg: #fff; }
+:root[data-accent="violet"] { --primary: #7c5cf0; --primary-fg: #fff; }
+:root[data-accent="green"]  { --primary: #1f9d61; --primary-fg: #fff; }
+:root[data-accent="orange"] { --primary: #e8742a; --primary-fg: #fff; }
+:root[data-accent="rose"]   { --primary: #e0457b; --primary-fg: #fff; }
+
+/* thin, dark scrollbars without a white track */
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; background: transparent; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 999px; }
+
+/* segmented control (theme / display toggles) */
+.seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: 9px; background: var(--tile); border: 1px solid var(--border); }
+.seg button {
+  width: 26px; height: 24px; border: none; border-radius: 7px; background: transparent;
+  color: var(--muted); display: grid; place-items: center; cursor: pointer; padding: 0;
+}
+.seg button:hover { color: var(--fg); }
+.seg button.on { background: var(--surface); color: var(--fg); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.seg.text button { width: auto; padding: 0 10px; font: inherit; font-size: 12px; font-weight: 550; }
+
+/* single theme button: a little spin when it changes */
+.theme-btn svg { transition: transform .3s ease; }
+.theme-btn:active svg { transform: rotate(-30deg) scale(.9); }

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session Manager</title>
+  <link rel="stylesheet" href="theme.css">
+  <link rel="stylesheet" href="manager.css">
+  <link rel="stylesheet" href="palette.css">
+  <link rel="icon" href="icons/icon32.png">
+  <script src="settings.js"></script>
+  <script src="icons.js"></script>
+  <script src="theme.js"></script>
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <div class="logo" id="logo"></div>
+      <div>
+        <h1>Session Manager</h1>
+        <div class="sub" id="sub"></div>
+      </div>
+    </div>
+
+    <nav class="views" role="tablist">
+      <button data-view="board" role="tab" class="on">Workflows</button>
+      <button data-view="history" role="tab">History</button>
+      <button data-view="settings" role="tab">Settings</button>
+    </nav>
+
+    <div class="bar-right">
+      <button id="paletteBtn" class="btn palette-btn" title="Command palette (Ctrl+K)"></button>
+      <label class="search board-only">
+        <span id="searchIcon"></span>
+        <input id="search" type="search" placeholder="Search tabs and workflows" autocomplete="off">
+        <kbd>/</kbd>
+      </label>
+      <select id="tagFilter" class="tag-filter board-only hidden" title="Show only workflows with this tag"></select>
+      <button id="addBtn" class="btn primary board-only"></button>
+      <button id="newTabBtn" class="iconbtn board-only"></button>
+      <button id="undoBtn" class="iconbtn" title="Undo (Ctrl+Z)" disabled></button>
+      <div id="displaySeg" class="seg board-only"></div>
+      <div id="themeSlot"></div>
+    </div>
+  </header>
+
+  <main id="boardView" class="view">
+    <div class="hint" id="hint"></div>
+    <div id="board" class="board"></div>
+    <div id="emptyBoard" class="empty-board hidden"></div>
+  </main>
+
+  <main id="historyView" class="view hidden">
+    <div id="history" class="settings"></div>
+  </main>
+
+  <main id="settingsView" class="view hidden">
+    <div id="settings" class="settings"></div>
+  </main>
+
+  <div id="menu" class="menu hidden" role="menu"></div>
+  <div id="modal" class="modal hidden"></div>
+  <div id="toast" class="toast" role="status"></div>
+  <input type="file" id="fileInput" accept=".json,.txt,application/json,text/plain" hidden>
+
+  <script src="sync-core.js"></script>
+  <script src="palette.js"></script>
+  <script src="manager.js"></script>
+</body>
+</html>
