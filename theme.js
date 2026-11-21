@@ -7,8 +7,10 @@ function applyAppearance(s) {
   if (s.theme === "light" || s.theme === "dark") r.dataset.theme = s.theme;
   else delete r.dataset.theme;
   r.dataset.accent = s.accent || "mono";
-  r.dataset.bg = s.background || "plain";
+  r.dataset.bg = s.background || "dots";
   r.dataset.density = s.density || "comfortable";
+  if (s.reduceMotion) r.dataset.motion = "reduce";
+  else delete r.dataset.motion;
 }
 
 // Fast path: apply the cached settings synchronously to avoid a flash of the wrong theme.

@@ -12,7 +12,7 @@
 ![Edge](https://img.shields.io/badge/Edge-compatible-0078D7?logo=microsoftedge&logoColor=white)
 ![No tracking](https://img.shields.io/badge/tracking-none-3fcf8e)
 
-[**Install from the Chrome Web Store**](CHROME_WEB_STORE_LINK) · [Report a bug](GITHUB_REPO_URL/issues)
+[**Install from the Chrome Web Store**](https://chromewebstore.google.com/detail/ipfjagejbpcgddgbcpllbiahgaljmclg?utm_source=item-share-cb) · [Report a bug](https://github.com/reapertakumi/Tab-Workflows/issues)
 
 <img src="store-assets/promo-marquee.png" alt="Tab Workflows – your tabs, organised into workflows" width="100%">
 
@@ -102,6 +102,7 @@ Install it from the [**Chrome Web Store**](CHROME_WEB_STORE_LINK). Updates insta
 | `unlimitedStorage` | Keeping larger collections, the undo history, the 30-day trash and daily backups without hitting the 10 MB limit |
 | `alarms` | Running the daily backup on time |
 | `favicon` | Showing website icons from Chrome's local cache |
+| `contextMenus` | The right-click menu on pages and links: **Send to** (saves the page into a workflow and closes the tab), **Copy to** (saves it, the tab stays open) and **Save link to** (saves a link without opening it). The menu only lists your workflow names; it reads nothing from the page except the address and title of the tab or link you right-clicked, and only when you pick an item |
 | `downloads` *(optional)* | Only requested if you choose to save backup files to your Downloads folder |
 
 ## 🗂️ Project structure
@@ -110,6 +111,7 @@ Install it from the [**Chrome Web Store**](CHROME_WEB_STORE_LINK). Updates insta
 | `manifest.json` | Extension manifest (MV3) |
 | `background.js` | Autosave, window ↔ workflow tracking, switching and all workflow/tab edits |
 | `bg-extras.js` | Undo history, trash, tab groups, move current tab, backups, Chrome sync |
+| `context-menu.js` | Right-click menu: send / copy a tab or save a link into a workflow |
 | `popup.html/.css/.js` | The toolbar popup |
 | `manager.html/.css/.js` | The Session Manager (board, list, canvas, history, settings) |
 | `palette.js/.css` | The `Ctrl+K` command palette |

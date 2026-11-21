@@ -88,3 +88,11 @@
 /* single theme button: a little spin when it changes */
 .theme-btn svg { transition: transform .3s ease; }
 .theme-btn:active svg { transform: rotate(-30deg) scale(.9); }
+
+/* Settings → Appearance → Reduce motion */
+:root[data-motion="reduce"] *, :root[data-motion="reduce"] *::before, :root[data-motion="reduce"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>────────</title>
+  <link rel="icon" id="icon" href="data:,">
+  <style>
+    :root { --bg: #f6f6f7; --fg: #1b1b1f; --muted: #8b8d98; --line: #8b8d98; color-scheme: light dark; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #151518; --fg: #ececf1; --muted: #7d7f8a; } }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+           display: grid; place-items: center; }
+    main { width: min(560px, calc(100% - 32px)); display: grid; gap: 18px; justify-items: center; }
+    .rule { display: flex; align-items: center; gap: 14px; width: 100%; }
+    .rule::before, .rule::after { content: ""; flex: 1; height: 4px; border-radius: 2px; background: var(--line); }
+    input { font-family: inherit; font-size: 22px; font-weight: 600; line-height: 1.2; color: var(--fg); background: transparent; border: none;
+            text-align: center; width: 60%; min-width: 120px; padding: 4px 6px; border-radius: 8px; outline: none; }
+    input:focus { background: color-mix(in srgb, var(--line) 14%, transparent); }
+    input::placeholder { color: var(--muted); font-weight: 500; }
+    .colors { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    .colors button { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--bg); padding: 0; cursor: pointer;
+                     box-shadow: 0 0 0 1px color-mix(in srgb, var(--muted) 50%, transparent); }
+    .colors button.on { box-shadow: 0 0 0 2px var(--fg); }
+    .icons { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; max-width: 520px; }
+    .icons button { width: 28px; height: 28px; border-radius: 8px; border: 1px solid transparent; background: transparent;
+                    color: var(--muted); display: grid; place-items: center; padding: 0; cursor: pointer; }
+    .icons button:hover { color: var(--fg); background: color-mix(in srgb, var(--muted) 14%, transparent); }
+    .icons button.on { color: var(--line); border-color: var(--line); background: color-mix(in srgb, var(--line) 12%, transparent); }
+    p { margin: 0; color: var(--muted); font-size: 12.5px; text-align: center; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="icons" id="icons" aria-label="Tab icon"></div>
+    <div class="rule"><input id="text" maxlength="80" placeholder="Name this divider" spellcheck="false" autocomplete="off"></div>
+    <div class="colors" id="colors"></div>
+    <p>A divider tab. It sleeps while you’re on other tabs, so it uses almost no memory.</p>
+  </main>
+  <script src="icons.js"></script>
+  <script src="divider.js"></script>
+</body>
+</html>

@@ -15,7 +15,7 @@
 // "new window" mode several workflows can be open (and autosaving) at the same time.
 // An open workflow is "live" when its autosave is on: manager edits then change the real tabs too.
 
-importScripts("settings.js", "sync-core.js", "bg-extras.js");
+importScripts("settings.js", "sync-core.js", "bg-extras.js", "context-menu.js");
 
 const EXT_PREFIX = chrome.runtime.getURL("");
 const MANAGER_URL = chrome.runtime.getURL("manager.html");
@@ -23,6 +23,9 @@ const NEWTAB_RE = /^(chrome|edge):\/\/newtab\/?$/i;
 const LOOSE = "__loose";
 
 let switching = false;      // suppress autosave while we close/open tabs during a switch
+let switchDepth = 0;        // nested pauses (a switch, a sync applying changes to open tabs, …)
+function pauseAutosave() { switchDepth++; switching = true; clearTimeout(saveTimer); }
+function resumeAutosave() { switchDepth = Math.max(0, switchDepth - 1); switching = switchDepth > 0; }
 let saveTimer = null;
 let settings = { ...DEFAULT_SETTINGS };
 getSettings().then(s => { settings = s; });
@@ -80,7 +83,21 @@ async function readWindows() {
     if (w.incognito) continue;
     const tabs = (w.tabs || []).slice().sort((a, b) => a.index - b.index)
       .map(t => ({ ...t, url: t.url || t.pendingUrl || "" }))
-      .filter(t => t.url && !t.url.startsWith(EXT_PREFIX) && !(s.skipNewTabs && NEWTAB_RE.test(t.url)));
+      .filter(t => t.url && (!t.url.startsWith(EXT_PREFIX) || isDividerUrl(t.url)) && !(s.skipNewTabs && NEWTAB_RE.test(t.url)));
+    if (s.skipDuplicateTabs) {
+      const seen = new Set();
+      for (let i = tabs.length - 1; i >= 0; i--) {
+        const t = tabs[i];
+        if (isDividerUrl(t.url) || NEWTAB_RE.test(t.url)) continue;   // dividers and blank tabs are never "duplicates"
+        if (t.active || t.pinned) seen.add(t.url);                    // keep the copy you're on / the pinned one
+      }
+      for (let i = 0; i < tabs.length; i++) {
+        const t = tabs[i];
+        if (isDividerUrl(t.url) || NEWTAB_RE.test(t.url) || t.active || t.pinned) continue;
+        if (seen.has(t.url)) { tabs.splice(i--, 1); continue; }
+        seen.add(t.url);
+      }
+    }
     if (tabs.length) out.push({ windowId: w.id, focused: w.focused, tabs });
   }
   return out;
@@ -137,19 +154,37 @@ async function takeSnapshot() {
 }
 
 // Keep the custom names you gave tabs when a workflow is re-saved from the open tabs.
+// Also keeps the manager-only dividers ("labels", stored as `section` on the tab below them).
 function carryNames(newWindows, oldWindows) {
   const byUrl = new Map();
   (oldWindows || []).forEach(w => w.tabs.forEach(t => { if (t.name && !byUrl.has(t.url)) byUrl.set(t.url, t.name); }));
-  if (!byUrl.size) return newWindows;
-  newWindows.forEach((w, wi) => w.tabs.forEach((t, ti) => {
+  if (byUrl.size) newWindows.forEach((w, wi) => w.tabs.forEach((t, ti) => {
     const same = oldWindows[wi] && oldWindows[wi].tabs[ti];
     const name = same && same.url === t.url && same.name ? same.name : byUrl.get(t.url);
     if (name) t.name = name;
   }));
+  carrySections(newWindows, oldWindows);
   return newWindows;
 }
 
-async function saveNow() {
+// A label sits above a tab. If that tab was closed, the label moves to the next tab that's still there.
+function carrySections(newWindows, oldWindows) {
+  (oldWindows || []).forEach((w, wi) => {
+    const tabs = w.tabs || [];
+    const target = newWindows[wi] || newWindows[newWindows.length - 1];
+    if (!target) return;
+    tabs.forEach((t, ti) => {
+      if (!t.section) return;
+      for (let j = ti; j < tabs.length; j++) {
+        const hit = target.tabs.find(x => x.url === tabs[j].url && !x.section);
+        if (hit) { hit.section = { ...t.section }; return; }
+      }
+    });
+  });
+}
+
+// `stamp`: mark every saved workflow as just changed, even if its tabs are the same (so it wins the next sync).
+async function saveNow({ stamp = false } = {}) {
   if (switching) return;
   const s = await getSettings();
   if (!s.autosaveEnabled) return;
@@ -179,8 +214,11 @@ async function saveNow() {
   for (const [id, saved] of groups) {
     const wf = workflows[id];
     if (wf.autosave === false) continue;
-    wf.windows = carryNames(JSON.parse(JSON.stringify(saved)), wf.windows);
-    wf.savedAt = snap.savedAt;
+    const windows = carryNames(JSON.parse(JSON.stringify(saved)), wf.windows);
+    // Only a real change (tabs added/removed/moved, pinned, renamed, regrouped) counts as a newer version
+    // for sync - switching tabs or a page title loading doesn't, so edits from other browsers aren't overruled.
+    if (stamp || !wf.savedAt || tabShape(windows) !== tabShape(wf.windows)) wf.savedAt = snap.savedAt;
+    wf.windows = windows;
     update.workflows = workflows;
   }
   await chrome.storage.local.set(update);
@@ -270,8 +308,47 @@ async function reconcileWindows() {
   await chrome.storage.local.set({ openWindows: map });
 }
 
-chrome.runtime.onInstalled.addListener(() => enqueue(async () => { ensureAlarms(); await reconcileWindows(); await saveNow(); }));
-chrome.runtime.onStartup.addListener(() => enqueue(async () => { ensureAlarms(); await reconcileWindows(); await saveNow(); await autoBackup(); }));
+chrome.runtime.onInstalled.addListener(details => enqueue(async () => {
+  ensureAlarms();
+  // First install: show the welcome sheet in the Session Manager.
+  if (details && details.reason === "install") {
+    await chrome.storage.local.set({ showWelcome: true });
+    openManager({}).catch(() => {});
+  }
+  await reconcileWindows();
+  // Brand-new install: the tabs you have open become your first workflow, "Current".
+  if (details && details.reason === "install") {
+    const { workflows = {} } = await chrome.storage.local.get("workflows");
+    if (!Object.keys(workflows).length) await saveAsWorkflow({ name: "Current", icon: "folder" });
+  }
+  await saveNow();
+}));
+chrome.runtime.onStartup.addListener(() => enqueue(async () => {
+  ensureAlarms();
+  await waitForRestoredTabs();
+  await reconcileWindows();
+  const s = await getSettings();
+  if (AUTO_SYNC_METHODS.includes(s.syncMethod) && s.syncApplyOnStartup) {
+    // Pick up what other browsers changed while this one was closed and apply it to the open tabs.
+    await multiSyncNow();
+    await saveNow();
+  } else {
+    // The tabs you start with are the newest version of their workflow.
+    await saveNow({ stamp: AUTO_SYNC_METHODS.includes(s.syncMethod) });
+  }
+  await autoBackup();
+}));
+
+// The browser restores its tabs a moment after start: wait until the tab count stops changing (max ~10 s).
+async function waitForRestoredTabs() {
+  const count = async () => (await chrome.tabs.query({})).length;
+  let last = await count(), steady = 0;
+  for (let i = 0; i < 20 && steady < 3; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    const n = await count();
+    if (n === last && n > 0) steady++; else { steady = 0; last = n; }
+  }
+}
 
 // ---------- live workflows ----------
 // The real windows of a workflow whose edits should also change real tabs, or null.
@@ -305,6 +382,7 @@ function cleanTab(t) {
   const out = { url: String(t.url || ""), title: String(t.title || t.url || ""), pinned: !!t.pinned, favIconUrl: String(t.favIconUrl || "") };
   if (t.name) out.name = String(t.name);
   if (t.group) out.group = String(t.group);
+  if (t.section) out.section = { text: String(t.section.text || ""), color: String(t.section.color || "grey") };
   return out;
 }
 
@@ -340,6 +418,18 @@ function whenLoaded(tabId, timeout = 20000) {
   });
 }
 
+// Chrome can give a tab a new id when it's put to sleep (discarded). Remember the swaps, so tabs
+// we're about to close are still found.
+const replacedTabs = new Map();      // old id -> new id
+chrome.tabs.onReplaced.addListener((added, removed) => {
+  replacedTabs.set(removed, added);
+  if (replacedTabs.size > 2000) replacedTabs.delete(replacedTabs.keys().next().value);
+});
+function currentTabId(id) {
+  for (let i = 0; i < 20 && replacedTabs.has(id); i++) id = replacedTabs.get(id);
+  return id;
+}
+
 function lazyLoad(tabs, savedTabs, activeTab) {
   tabs.forEach((t, i) => {
     if (!t || t.id === (activeTab && activeTab.id)) return;
@@ -347,8 +437,12 @@ function lazyLoad(tabs, savedTabs, activeTab) {
     if (!/^https?:/i.test(url || "")) return;
     whenLoaded(t.id).then(async r => {
       if (r !== "complete") return;                       // still busy after 20 s: leave it as it is
-      const cur = await chrome.tabs.get(t.id).catch(() => null);
-      if (cur && !cur.active && !cur.discarded && cur.status === "complete") chrome.tabs.discard(t.id).catch(() => {});
+      // Never put a tab to sleep in the middle of a switch (its id could change while it's being
+      // closed, and it would stay open): wait until the switch is over.
+      for (let n = 0; switching && n < 120; n++) await new Promise(res => setTimeout(res, 500));
+      const id = currentTabId(t.id);
+      const cur = await chrome.tabs.get(id).catch(() => null);
+      if (cur && !cur.active && !cur.discarded && cur.status === "complete") chrome.tabs.discard(id).catch(() => {});
     });
   });
 }
@@ -388,7 +482,7 @@ async function openSavedWindow(sw, opts, lazy = false) {
     win = await chrome.windows.create({ url: urls, ...opts });
   } catch (e) {
     // A URL was refused (e.g. some chrome:// pages) – swap those for a new tab so positions still line up.
-    win = await chrome.windows.create({ url: urls.map(u => (SAFE_URL.test(u) ? u : "chrome://newtab/")), ...opts });
+    win = await chrome.windows.create({ url: urls.map(u => (SAFE_URL.test(u) || isDividerUrl(u) ? u : "chrome://newtab/")), ...opts });
   }
   const tabs = (win.tabs || []).slice().sort((a, b) => a.index - b.index);
   watchTabs(tabs.map(t => t.id));
@@ -443,13 +537,16 @@ async function saveGroupCopies(tabs) {
 
 async function closeTabsArchivingGroups(tabs) {
   const fresh = [];
-  for (const t of tabs) { const f = await chrome.tabs.get(t.id).catch(() => null); if (f) fresh.push(f); }
+  for (const t of tabs) { const f = await chrome.tabs.get(currentTabId(t.id)).catch(() => null); if (f) fresh.push(f); }
   await saveGroupCopies(fresh).catch(e => console.warn("Tab Workflows: couldn't save group copies", e));
   // Closing a group's tabs only *closes* the group (Chrome keeps it in its saved tab groups);
   // ungrouping them first is what deletes it. Then the tabs close.
   const grouped = HAS_GROUPS ? fresh.filter(t => typeof t.groupId === "number" && t.groupId >= 0).map(t => t.id) : [];
   if (grouped.length) await chrome.tabs.ungroup(grouped).catch(() => {});
-  if (fresh.length) await chrome.tabs.remove(fresh.map(t => t.id)).catch(() => {});
+  if (!fresh.length) return;
+  // One call for all of them; if that fails (a tab changed or went away meanwhile), close them one by one.
+  await chrome.tabs.remove(fresh.map(t => currentTabId(t.id))).catch(() =>
+    Promise.all(fresh.map(t => chrome.tabs.remove(currentTabId(t.id)).catch(() => {}))));
 }
 
 // Reopen a saved group copy as a tab group at the end of your current window.
@@ -482,7 +579,20 @@ async function fillWindow(win, sw, keepManager, lazy = false) {
   if (!created.length) return;
   // 2) …the old workflow's tabs close (a copy of each of their groups is kept, the groups are deleted)…
   if (oldTabs.length) await closeTabsArchivingGroups(oldTabs);
-  for (const m of managerTabs) await chrome.tabs.move(m.id, { index: -1 }).catch(() => {});
+  // With many tabs some old ones could survive (one was put to sleep and got a new id, one failed to
+  // close…) and would then be saved into the new workflow. Check the window and close what's left over.
+  const keep = new Set(managerTabs.map(t => t.id));
+  for (let pass = 0; pass < 3; pass++) {
+    const mine = new Set(created.filter(Boolean).map(t => currentTabId(t.id)));
+    const now = await chrome.tabs.query({ windowId: win.id }).catch(() => []);
+    const left = now.filter(t => !mine.has(t.id) && !keep.has(t.id) && ![...keep].some(k => currentTabId(k) === t.id)
+      && !(keepManager && (t.url || t.pendingUrl || "").startsWith(MANAGER_URL)));
+    if (!left.length) break;
+    console.warn(`Tab Workflows: ${left.length} old tab(s) were still open after switching – closing them`);
+    await closeTabsArchivingGroups(left);
+    await new Promise(r => setTimeout(r, 250));
+  }
+  for (const m of managerTabs) await chrome.tabs.move(currentTabId(m.id), { index: -1 }).catch(() => {});
   // 3) …and then the new workflow's tab groups are created.
   await applyGroups(created, sw, created.active);
 }
@@ -559,13 +669,29 @@ async function windowsOf(id) {
   return wins.filter(w => !w.incognito && ownerOf(w.id, map, activeWorkflowId) === id).map(w => w.id);
 }
 
+// Autosave is paused for the whole switch: from the first tab closing until every new tab has its
+// address. Only then is the new state saved once – so a half-switched set of tabs is never saved
+// (and never synced) into either workflow.
 async function withSwitching(fn) {
-  clearTimeout(saveTimer);
-  switching = true;
+  pauseAutosave();
+  await chrome.storage.session?.set({ switchingWorkflow: Date.now() }).catch(() => {});
   try { return await fn(); }
   finally {
-    switching = false;
-    setTimeout(() => enqueue(saveNow), 1500); // let URLs settle, then save fresh state
+    await waitForTabsToSettle().catch(() => {});
+    resumeAutosave();
+    await chrome.storage.session?.remove("switchingWorkflow").catch(() => {});
+    if (!switching) await saveNow().catch(() => {});
+  }
+}
+
+// Every tab has a real address (not blank / still being created) – at least 0.8 s, at most 6 s.
+async function waitForTabsToSettle() {
+  const start = Date.now();
+  await new Promise(r => setTimeout(r, 800));
+  while (Date.now() - start < 6000) {
+    const tabs = await chrome.tabs.query({ windowType: "normal" });
+    if (tabs.every(t => (t.url || t.pendingUrl) && !(t.status === "loading" && isBlank(t.url) && !t.pendingUrl))) return;
+    await new Promise(r => setTimeout(r, 250));
   }
 }
 
@@ -612,11 +738,19 @@ async function saveIntoWorkflow({ id }) {
   const [wins, map, { workflows, activeWorkflowId }] = await Promise.all([readWindows(), getOpenWindows(), loadState()]);
   if (!workflows[id]) return;
   const mine = wins.filter(w => ownerOf(w.windowId, map, activeWorkflowId) === id);
-  if (!mine.length) return;
+  if (!mine.length) return false;
   const snap = await snapshotOf(mine);
   workflows[id].windows = carryNames(JSON.parse(JSON.stringify(snap.windows)), workflows[id].windows);
   workflows[id].savedAt = snap.savedAt;
   await persist({ workflows });
+  return { name: workflows[id].name, tabs: snap.windows.reduce((n, w) => n + w.tabs.length, 0) };
+}
+
+// "Save current" in the popup: save the open tabs into the workflow you're in.
+async function saveCurrent() {
+  const { workflows, activeWorkflowId } = await loadState();
+  if (!activeWorkflowId || !workflows[activeWorkflowId]) return false;
+  return saveIntoWorkflow({ id: activeWorkflowId });
 }
 
 async function editWorkflow({ id, name, icon, note, color, tags }) {
@@ -631,6 +765,7 @@ async function editWorkflow({ id, name, icon, note, color, tags }) {
     const list = [...new Set((tags || []).map(t => String(t).trim().toLowerCase()).filter(Boolean))].slice(0, 12);
     if (list.length) wf.tags = list; else delete wf.tags;
   }
+  wf.savedAt = Date.now();     // newer version -> other browsers pick up the new name / icon
   await persist({ workflows });
 }
 
@@ -638,6 +773,7 @@ async function setAutosave({ id, value }) {
   const { workflows } = await loadState();
   if (!workflows[id]) return;
   workflows[id].autosave = !!value;
+  workflows[id].savedAt = Date.now();
   await persist({ workflows });
   if (value) await saveNow(); // catch up immediately
 }
@@ -824,7 +960,8 @@ async function removeTab({ id, win, idx, trash = true }) {
   const layout = await liveLayoutFor(id);
   const liveTab = layout && layout[win] ? layout[win].tabs[idx] : null;
 
-  w.tabs.splice(idx, 1);
+  const [gone] = w.tabs.splice(idx, 1);
+  if (gone && gone.section && w.tabs[idx] && !w.tabs[idx].section) w.tabs[idx].section = gone.section;
   if (idx < (w.activeIndex || 0)) w.activeIndex--;
   wf.windows = wf.windows.filter(x => x.tabs.length);
   wf.windows.forEach(fixActive);
@@ -833,7 +970,7 @@ async function removeTab({ id, win, idx, trash = true }) {
   if (liveTab) await closeLiveTabs([liveTab.id], layout);
 }
 
-async function addTab({ id, win = 0, url, name = "" }) {
+async function addTab({ id, win = 0, url, name = "", title = "", favIconUrl = "" }) {
   url = normalizeUrl(url);
   if (!url) return;
   const { workflows } = await loadState();
@@ -842,9 +979,8 @@ async function addTab({ id, win = 0, url, name = "" }) {
   wf.windows = wf.windows || [];
   const wi = Math.min(win, wf.windows.length);
   if (!wf.windows[wi]) wf.windows[wi] = { tabs: [], activeIndex: 0 };
-  let title = url;
-  try { title = new URL(url).hostname || url; } catch (_) {}
-  const tab = { url, title, pinned: false, favIconUrl: "" };
+  if (!title) { title = url; try { title = new URL(url).hostname || url; } catch (_) {} }
+  const tab = { url, title: String(title), pinned: false, favIconUrl: /^(https?:|data:)/.test(favIconUrl) ? favIconUrl : "" };
   if (name && name.trim()) tab.name = name.trim();
   wf.windows[wi].tabs.push(tab);
   wf.savedAt = Date.now();
@@ -877,7 +1013,8 @@ async function editTab({ id, win, idx, name, url }) {
   const urlChanged = url && url !== tab.url;
   if (urlChanged) {
     tab.url = url;
-    try { tab.title = new URL(url).hostname || url; } catch (_) { tab.title = url; }
+    if (isDividerUrl(url)) tab.title = dividerTitle(dividerInfo(url).text);
+    else try { tab.title = new URL(url).hostname || url; } catch (_) { tab.title = url; }
     tab.favIconUrl = "";
   }
   workflows[id].savedAt = Date.now();
@@ -1017,7 +1154,8 @@ const handlers = {
   saveAsWorkflow, saveIntoWorkflow, editWorkflow, setAutosave, deleteWorkflow,
   openWorkflow, createWorkflow, createEmptyWorkflow,
   moveTab, moveTabs, removeTab, removeTabs, addTab, editTab, focusTab, sortWorkflow, dedupeWorkflow, clearWorkflow,
-  importWorkflows, clearAllData, openManager,
+  importWorkflows, clearAllData, openManager, saveCurrent,
+  addDivider, editDivider, removeLabel, insertDividerTab, restoreWorkflowCopy,
   undo, undoTo, clearHistory, restoreFromTrash, deleteFromTrash, emptyTrash, openGroupCopy, deleteGroupCopy,
   makeBackup: () => makeBackup({ auto: false }), downloadLatestBackup: async () => {
     const { backups = [] } = await chrome.storage.local.get("backups");

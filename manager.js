@@ -266,7 +266,7 @@ async function openWorkflow(wf) {
 }
 
 async function deleteWorkflow(wf) {
-  if (!(await confirmDialog(`Delete “${wf.name}”?`, `Its ${plural(countTabs(wf), "saved tab")} will be removed. Your open tabs are not affected.`, "Delete", true))) return;
+  if (settings.confirmDelete && !(await confirmDialog(`Delete “${wf.name}”?`, `Its ${plural(countTabs(wf), "saved tab")} will be removed. Your open tabs are not affected.`, "Delete", true))) return;
   await send("deleteWorkflow", { id: wf.id });
   toast(`Deleted “${wf.name}” – it’s in History & trash`, undoAction);
 }
@@ -283,6 +283,8 @@ function cardMenu(anchor, wf) {
     { icon: "edit", label: "Rename / change icon", action: () => editWorkflow(wf) },
     { icon: "tag", label: "Note, colour & tags…", action: () => detailsDialog(wf) },
     { icon: "copy", label: "Copy all links", action: () => copyLinks(wf) },
+    { icon: "divider", label: "Add divider tab…", action: () => addDividerFlow(wf, Math.max(0, (wf.windows || []).length - 1), undefined, false) },
+    { icon: "history", label: "Backup copies…", action: () => copiesDialog(wf) },
     { icon: "sort", label: "Sort by title", action: () => send("sortWorkflow", { id: wf.id, by: "title" }) },
     { icon: "globe2", label: "Sort by website", action: () => send("sortWorkflow", { id: wf.id, by: "site" }) },
     { icon: "dedupe", label: "Remove duplicates", action: async () => {
@@ -408,7 +410,9 @@ function attachListDrop(ul) {
     e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
     const before = rowBefore(ul, e.clientY, e.clientX);
     if (!ul.classList.contains("empty-list")) {
-      if (before) { if (dropLine.nextSibling !== before) ul.insertBefore(dropLine, before); }
+      let ref = before;
+      while (ref && ref.previousElementSibling && ref.previousElementSibling.classList.contains("label-row")) ref = ref.previousElementSibling;
+      if (ref) { if (dropLine.nextSibling !== ref) ul.insertBefore(dropLine, ref); }
       else if (ul.lastChild !== dropLine) ul.append(dropLine);
     }
     const card = ul.closest(".card");
@@ -551,7 +555,7 @@ async function bulkAction(wf, kind) {
   const live = isLive(wf);
 
   if (kind === "remove") {
-    const ok = await confirmDialog(`Remove ${plural(n, "tab")} from “${wf.name}”?`,
+    const ok = !settings.confirmDelete || await confirmDialog(`Remove ${plural(n, "tab")} from “${wf.name}”?`,
       live ? "This workflow is open, so these tabs will be closed in the browser too." : "They’ll be removed from this workflow.", "Remove", true);
     if (!ok) return;
     await send("removeTabs", { id: wf.id, items });
@@ -635,8 +639,25 @@ function renderRow(wf, wi, ti, t, hidden, q) {
   const label = t.name || t.title || t.url;
   const sel = selFor(wf.id);
   const picked = !!sel && sel.keys.has(keyOf(wi, ti));
-  const row = el("li", { className: "tab-row" + (hidden ? " hide" : "") + (picked ? " picked" : ""), draggable: true,
-      title: label === t.url ? t.url : `${label}\n${t.url}`, "data-idx": ti }, [
+  const dv = isDividerTab(t) ? dividerOf(t.url) : null;
+  const row = el("li", { className: "tab-row" + (dv ? " divider-row" : "") + (hidden ? " hide" : "") + (picked ? " picked" : ""), draggable: true,
+      title: dv ? "Divider tab – sleeps when you’re not on it" : label === t.url ? t.url : `${label}\n${t.url}`, "data-idx": ti,
+      "data-gcolor": dv ? dv.color : null }, dv ? [
+    sel ? el("input", { type: "checkbox", className: "row-check", checked: picked, tabIndex: -1, "aria-label": "Select divider" }) : null,
+    el("span", { className: "div-line" }),
+    el("span", { className: "div-text" }, [highlight(dv.text || "Divider", q)]),
+    el("span", { className: "div-line" }),
+    el("div", { className: "row-actions" }, [
+      el("button", { title: "Change text and colour", html: svgIcon("edit", 13),
+        on: { click: async e => {
+          e.stopPropagation();
+          const r = await dividerDialog({ title: "Edit divider tab", text: dv.text, color: dv.color, kind: "tab" });
+          if (r) send("editDivider", { id: wf.id, win: wi, idx: ti, text: r.text, color: r.color, kind: "tab" });
+        } } }),
+      el("button", { className: "rm", title: live ? "Close this divider" : "Remove divider", html: svgIcon("close", 13),
+        on: { click: async e => { e.stopPropagation(); await send("removeTab", { id: wf.id, win: wi, idx: ti }); toast("Removed a divider", undoAction); } } })
+    ])
+  ] : [
     sel ? el("input", { type: "checkbox", className: "row-check", checked: picked, tabIndex: -1, "aria-label": "Select " + label }) : null,
     el("span", { className: "tab-num", textContent: ti + 1 }),
     favicon(t.url, t.favIconUrl),
@@ -649,6 +670,8 @@ function renderRow(wf, wi, ti, t, hidden, q) {
     el("div", { className: "row-actions" }, [
       el("button", { title: "Edit name and link", html: svgIcon("edit", 13),
         on: { click: e => { e.stopPropagation(); editTabDialog(wf, wi, ti, t); } } }),
+      el("button", { title: "Add a divider above this tab", html: svgIcon("divider", 13),
+        on: { click: e => { e.stopPropagation(); addDividerFlow(wf, wi, ti, !t.section); } } }),
       el("button", { title: live ? "Go to this tab" : "Open in a new tab", html: svgIcon("external", 13),
         on: { click: e => { e.stopPropagation(); send("focusTab", { id: wf.id, win: wi, idx: ti }); } } }),
       el("button", { className: "rm", title: live ? "Close this tab" : (wf.id === LOOSE ? "Delete this tab" : "Remove from workflow"), html: svgIcon("close", 13),
@@ -757,6 +780,7 @@ function renderCard(wf, i) {
       const m = !q || nameMatch || ((t.name || "") + " " + (t.title || "") + " " + t.url).toLowerCase().includes(q);
       if (m && q) matches++;
       const g = t.group && w.groups && w.groups[t.group];
+      if (t.section && !q && !loose) ul.append(labelRow(wf, wi, ti, t.section));
       if (t.group !== lastGroup) {
         lastGroup = t.group;
         if (g && !q) ul.append(groupHeader(g, w.tabs.filter(x => x.group === t.group).length));
@@ -883,7 +907,7 @@ const SETTINGS_PAGES = [
   ["saving", "Saving", "save"],
   ["switching", "Switching", "switch"],
   ["backups", "Backups", "calendar"],
-  ["sync", "Sync", "cloud"],
+  ["sync", "Sync", "cloud", "Beta"],
   ["data", "Data", "download"],
   ["about", "About", "help"]
 ];
@@ -898,6 +922,7 @@ function openSettingsPage(id) {
 }
 
 let settingsRenderId = 0;
+let lastSettingsPage = null;
 async function renderSettings() {
   const myId = ++settingsRenderId;
   const section = (title, rows) => el("section", { className: "set-section" }, [title ? el("h2", { textContent: title }) : null, ...rows]);
@@ -905,15 +930,19 @@ async function renderSettings() {
   const content = await settingsPageContent(page[0], section);
   if (myId !== settingsRenderId) return;          // a newer render started meanwhile
 
-  const nav = el("nav", { className: "set-nav", "aria-label": "Settings" }, SETTINGS_PAGES.map(([id, label, icon]) =>
+  const nav = el("nav", { className: "set-nav", "aria-label": "Settings" }, SETTINGS_PAGES.map(([id, label, icon, badge]) =>
     el("button", { className: "set-nav-item" + (id === page[0] ? " on" : ""), html: svgIcon(icon, 16), "aria-current": id === page[0] ? "page" : null,
-      on: { click: () => openSettingsPage(id) } }, [el("span", { textContent: label })])));
+      on: { click: () => openSettingsPage(id) } }, [el("span", { textContent: label }), badge ? el("span", { className: "beta-badge", textContent: badge }) : null])));
   const target = $("settings");
   const fresh = !target.querySelector(".settings-layout");
+  // Opening Settings or switching to another page animates; a redraw of the same page (a setting changed) doesn't.
+  const switched = !fresh && lastSettingsPage !== page[0];
+  lastSettingsPage = page[0];
   target.replaceChildren(el("div", { className: "settings-layout" }, [
     nav,
-    el("div", { className: "set-panel" + (fresh ? "" : " no-anim") }, [el("h1", { className: "set-page-title", textContent: page[1] }), ...content])
+    el("div", { className: "set-panel" + (fresh ? "" : switched ? " page-in" : " no-anim") }, [el("h1", { className: "set-page-title" }, [page[1], page[3] ? el("span", { className: "beta-badge big", textContent: page[3] }) : null]), ...content])
   ]));
+  moveSlider(nav, "settingsNav");      // the menu is rebuilt: its highlight slides from the page you were on
 }
 
 async function settingsPageContent(id, section) {
@@ -932,6 +961,9 @@ async function settingsPageContent(id, section) {
         row("Layout", "Board: columns that resize with the window. List: one column. Canvas: drag workflows anywhere on an endless canvas.", segText("display", [["board", "Board"], ["list", "List"], ["canvas", "Canvas"]])),
         row("Tab display", "Compact: one line per tab. Comfortable: title and website. Detailed: title, full link and position. Icons: a grid of site icons (hover for the name).",
           segText("density", [["compact", "Compact"], ["comfortable", "Comfortable"], ["detailed", "Detailed"], ["icons", "Icons"]]))
+      ]),
+      section("Motion", [
+        row("Reduce motion", "Turn off animations, sliding highlights and page transitions here and in the popup. Your system’s “reduce motion” setting is always respected too.", switchCtl("reduceMotion"))
       ])
     ];
   }
@@ -941,7 +973,8 @@ async function settingsPageContent(id, section) {
       row("Autosave delay", "How long to wait after the last tab change before saving.",
         selectCtl("autosaveDelay", [[400, "Instant (0.4 s)"], [1000, "1 second"], [3000, "3 seconds"], [10000, "10 seconds"]])),
       row("Autosave new workflows", "New workflows start with autosave turned on.", switchCtl("newWorkflowAutosave")),
-      row("Skip empty New Tab pages", "Don’t store blank New Tab pages in sessions and workflows.", switchCtl("skipNewTabs"))
+      row("Skip empty New Tab pages", "Don’t store blank New Tab pages in sessions and workflows.", switchCtl("skipNewTabs")),
+      row("Skip duplicate tabs", "Store a link only once per window. The tab you’re on and pinned tabs are always kept; your open tabs aren’t closed.", switchCtl("skipDuplicateTabs"))
     ])];
   }
   if (id === "switching") {
@@ -951,6 +984,12 @@ async function settingsPageContent(id, section) {
       row("Save memory after switching", "Background tabs finish loading and are then put to sleep until you click them. Tabs are never interrupted while loading, and a tab that’s stuck when you open it is reloaded.", switchCtl("lazyLoad")),
       row("Ask before switching", "Always confirm before closing your tabs to open another workflow. You’re always asked when unsaved tabs would be lost.", switchCtl("confirmSwitch")),
       row("Keep this page open", "Re-open the Session Manager after switching workflows.", switchCtl("keepManagerOpen"))
+    ]), section("Dividers", [
+      row("Put divider tabs to sleep", "Divider tabs are put to sleep whenever you’re on another tab, so they use almost no memory. Clicking one wakes it up instantly.", switchCtl("dividerSleep")),
+      row("Insert a divider tab", "Adds a divider right after the tab you’re on – also from the divider button in the popup. Click the shortcut to change it on the browser’s shortcuts page.",
+        el("button", { type: "button", className: "keycap edit", textContent: await browserShortcut("insert-divider") || "Not set",
+          title: "Change this shortcut on the browser’s shortcuts page",
+          on: { click: () => chrome.tabs.create({ url: "chrome://extensions/shortcuts" }) } }))
     ])];
   }
   if (id === "backups") return [await backupSection(section)];
@@ -969,6 +1008,13 @@ async function settingsPageContent(id, section) {
         row("Export & import", "Export all workflows to a JSON file, or import a JSON export or a text file of links.",
           el("div", { className: "row-btns" }, [fileBtn, exportBtn]))
       ]),
+      section("Deleting & undo", [
+        row("Ask before deleting", "Confirm before deleting a workflow or removing tabs from one. Either way, Undo and the trash can bring them back.", switchCtl("confirmDelete")),
+        row("Keep deleted items", "How long deleted workflows and tabs stay in History & trash (at most 60 items).",
+          selectCtl("trashDays", [[7, "7 days"], [30, "30 days"], [90, "90 days"], [0, "Until the trash is full"]])),
+        row("Undo steps", "How many recent changes you can undo. More steps use more storage on this device.",
+          selectCtl("historyMax", [[10, "10"], [25, "25"], [50, "50"], [100, "100"]]))
+      ]),
       section("Reset", [
         row("Reset settings", "Put every setting back to how it was when you installed Tab Workflows. Your workflows stay.",
           el("button", { className: "btn sm", html: svgIcon("undo", 14) + "Reset settings", on: { click: async () => {
@@ -984,10 +1030,23 @@ async function settingsPageContent(id, section) {
   let bytes = 0;
   try { bytes = await chrome.storage.local.getBytesInUse(null); } catch (_) {}
   const version = (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || "";
-  const keys = [["Ctrl K", "Command palette"], ["Ctrl Z", "Undo"], ["/", "Search the board"], ["Ctrl + scroll", "Zoom"], ["Esc", "Close / stop selecting"]];
+  const notice = (await chrome.storage.local.get("updateNotice")).updateNotice;
+  const keys = [["Ctrl K", "Command palette"], ["Ctrl Z", "Undo"], ["Alt Shift D", "Insert a divider tab (in any tab)"], ["/", "Search the board"], ["Ctrl + scroll", "Zoom"], ["Esc", "Close / stop selecting"]];
   return [
-    section("Tab Workflows", [row("Version " + version, `${(bytes / 1024).toFixed(1)} KB stored on this device`, el("span"))]),
-    section("Keyboard", keys.map(([k, what]) => row(what, null, el("kbd", { className: "keycap", textContent: k }))))
+    section("Tab Workflows", [
+      row("Version " + version, `${(bytes / 1024).toFixed(1)} KB stored on this device`,
+        notice ? el("button", { className: "btn sm primary", textContent: `Update to ${notice.latest}`, on: { click: () => showUpdateScreen(notice) } }) : el("span")),
+      row("Welcome screen", "The short introduction shown after installing.", el("button", { className: "btn sm", textContent: "Show", on: { click: () => showWelcome() } }))
+    ]),
+    section("Keyboard", [
+      el("div", { className: "set-row muted", textContent: "These shortcuts only work in the Session Manager – except Alt Shift D, which works in every tab. Click a shortcut, then press the new keys (Esc cancels)." }),
+      ...HOTKEY_ACTIONS.map(([id, what]) => row(what, null, hotkeyCap(id))),
+      row("Insert a divider tab (in any tab)", "Set by the browser, so it’s changed on the browser’s shortcuts page.",
+        el("div", { className: "row-btns" }, [el("kbd", { className: "keycap", textContent: await browserShortcut("insert-divider") || "Not set" }),
+          el("button", { className: "btn sm", textContent: "Change", on: { click: () => chrome.tabs.create({ url: "chrome://extensions/shortcuts" }) } })])),
+      row("Zoom", null, el("kbd", { className: "keycap", textContent: "Ctrl + scroll" })),
+      row("Close / stop selecting", null, el("kbd", { className: "keycap", textContent: "Esc" }))
+    ])
   ];
 }
 
@@ -1008,13 +1067,89 @@ async function askHostAccess(urls) {
   try { return await chrome.permissions.request({ origins }); } catch (_) { return false; }
 }
 
-async function runSync(force = false) {
-  if (settings.syncMethod === "folder") return folderSyncNow({ ask: true, force });
+// `passphrase`: only right after you typed it – lets this sync read a file an older version wrote.
+async function runSync(force = false, passphrase = "") {
+  if (settings.syncMethod === "folder") return folderSyncNow({ ask: true, force, passphrase });
   if (MULTI_SYNC.includes(settings.syncMethod)) {
-    const r = await send("multiSyncNow", { force });
+    const r = await send("multiSyncNow", { force, passphrase });
     return r.result;
   }
   return null;
+}
+
+function syncLabel(min) {
+  const m = Number(min) || 0;
+  if (m < 1) return `${Math.round(m * 60)} seconds`;
+  if (m >= 60) return m === 60 ? "1 hour" : `${m / 60} hours`;
+  return m === 1 ? "1 minute" : `${m} minutes`;
+}
+
+// Green dot "Connected" when the last sync worked, red dot "Disconnected" when it failed.
+// `method` given: a Disconnect button next to it (once this browser has tried to sync).
+function connectionRow(st, idleText, method) {
+  const state = !st ? "idle" : st.ok ? "on" : "off";
+  const label = { on: "Connected", off: "Disconnected", idle: "Not connected yet" }[state];
+  const detail = state === "on" ? `Last synced ${timeAgo(st.at)}.`
+    : state === "off" ? `${st.error || "The last sync failed."} · ${timeAgo(st.at)}` : idleText;
+  const pill = el("span", { className: "conn-pill " + state, role: "status" }, [el("span", { className: "conn-dot" }), label]);
+  return row("Connection", detail, method && st
+    ? el("div", { className: "row-btns" }, [pill, el("button", { className: "btn sm", textContent: "Disconnect", on: { click: () => disconnectSync(method) } })])
+    : pill);
+}
+
+// Stop syncing this browser and forget how it connected (login, token, address). Your workflows and the
+// passphrase stay; the synced copy elsewhere isn't touched.
+const SYNC_LOGIN_FIELDS = {
+  webdav: { webdavUrl: null, webdavUser: null, webdavPass: null, webdavReady: null },
+  gist: { gistToken: null, gistVerified: null },
+  server: { serverUrl: null },
+  folder: {},
+  chrome: {}
+};
+async function disconnectSync(method) {
+  const name = (SYNC_METHODS.find(m => m[0] === method) || [, "sync"])[1];
+  const forget = method === "folder" ? "the chosen folder" : method === "chrome" ? null : "the login saved for it";
+  if (!(await confirmDialog(`Disconnect ${name}?`,
+    `This browser stops syncing${forget ? ` and forgets ${forget}` : ""}. Your workflows stay here, and the synced copy isn’t deleted – you can connect again any time.`, "Disconnect", true))) return;
+  await saveSyncFields(SYNC_LOGIN_FIELDS[method] || {});
+  if (method === "folder") await idbSet("syncFolder", null).catch(() => {});
+  for (const k of Object.keys(secretSavedAt)) delete secretSavedAt[k];
+  webdavDraft = null;
+  await chrome.storage.local.remove(["multiSyncStatus", method === "chrome" ? "syncStatus" : null].filter(Boolean));
+  await setSetting("syncMethod", "off");
+  toast(`Disconnected from ${name}`);
+}
+
+// Is this browser connected to the method's storage (folder chosen, token or address saved)?
+async function methodLinked(method, cfg) {
+  if (method === "folder") return !!(await idbGet("syncFolder").catch(() => null));
+  if (method === "gist") return !!(cfg.gistToken && (cfg.gistVerified || cfg.gistId));   // a token Connect checked (or that already synced)
+  if (method === "server") return !!cfg.serverUrl;
+  if (method === "webdav") return !!(cfg.webdavUrl && cfg.webdavPass);
+  return false;
+}
+const hasSyncPassphrase = async () => {
+  const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
+  return !!(syncConfig.hasPassphrase || syncConfig.passphrase);
+};
+let focusPassNext = false;   // just connected: put the cursor in the passphrase that appears
+
+// After connecting: sync if there's a passphrase already, else show the passphrase step.
+async function afterConnect(what) {
+  if (await hasSyncPassphrase()) return syncToast(await runSync());
+  toast(`${what} – now choose your passphrase`);
+  focusPassNext = true;
+  renderSettings();
+}
+
+// Check a GitHub token before saving it. "" when it works, else what's wrong.
+async function testGistToken(token) {
+  try {
+    const r = await fetch("https://api.github.com/gists?per_page=1", { headers: { Authorization: "token " + token, Accept: "application/vnd.github+json" }, cache: "no-store" });
+    if (r.status === 401) return "That GitHub token isn’t valid – create a new one.";
+    if (r.status === 403) return "That token may not use gists – tick “gist” when you create it.";
+    return r.ok ? "" : `GitHub answered with error ${r.status}.`;
+  } catch (_) { return "Couldn’t reach GitHub – check your internet connection."; }
 }
 
 function syncToast(st) {
@@ -1028,6 +1163,8 @@ async function syncPage(section) {
   const method = settings.syncMethod || "off";
   const multi = MULTI_SYNC.includes(method);
   const out = [];
+  out.push(el("div", { className: "beta-note" }, [el("span", { className: "beta-badge", textContent: "Beta" }),
+    el("span", { textContent: "Sync between browsers is new and still being tested. Daily backups and the 3 backup copies per workflow keep you safe if something goes wrong." })]));
 
   out.push(section("How to sync", [el("div", { className: "method-grid" }, SYNC_METHODS.map(([id, label, icon, desc]) =>
     el("button", { className: "method" + (id === method ? " on" : ""), "aria-pressed": String(id === method),
@@ -1035,7 +1172,9 @@ async function syncPage(section) {
         if (id === method) return;
         await setSetting("syncMethod", id);
         if (id === "chrome") { const r = await send("syncNow"); toast(r.ok && r.result && r.result.ok ? "Synced to your Chrome profile" : "Chrome profile sync turned on"); }
-        else if (MULTI_SYNC.includes(id) && syncConfig.passphrase && id !== "folder") syncToast(await runSync());
+        else if (MULTI_SYNC.includes(id) && (syncConfig.hasPassphrase || syncConfig.passphrase) && id !== "folder"
+                 && !(id === "webdav" && !webdavReady(syncConfig))
+                 && !(id === "gist" && !syncConfig.gistTokenEnc) && !(id === "server" && !syncConfig.serverUrlEnc)) syncToast(await runSync());
       } } }, [
       el("span", { className: "tile sm", html: svgIcon(icon, 16) }),
       el("span", { className: "method-text" }, [el("span", { className: "method-name", textContent: label }), el("span", { className: "method-desc", textContent: desc })]),
@@ -1044,26 +1183,68 @@ async function syncPage(section) {
 
   if (method === "chrome") out.push(await chromeSyncSection(section, syncStatus));
 
+  // WebDAV that isn't set up yet: one step at a time (folder → login → passphrase). Afterwards everything shows.
+  if (method === "webdav" && !webdavReady(syncConfig)) {
+    out.push(await webdavSetupSection(section, syncConfig));
+    return out;
+  }
+
   if (multi) {
     // Passphrase
-    const pass = el("input", { type: "password", className: "field", value: syncConfig.passphrase || "", placeholder: "Same passphrase in every browser", autocomplete: "new-password" });
-    const eye = el("button", { className: "iconbtn flat", title: "Show / hide", html: svgIcon("eye", 15), on: { click: () => { pass.type = pass.type === "password" ? "text" : "password"; } } });
+    const hasPass = !!(syncConfig.hasPassphrase || syncConfig.passphrase);
+    const { pass, eye, markSaved } = passphraseField();
     const savePass = el("button", { className: "btn sm primary", textContent: "Save", on: { click: async () => {
       const v = pass.value;
       if (v.length < 8) { toast("Use at least 8 characters"); pass.focus(); return; }
-      if (syncConfig.passphrase && v !== syncConfig.passphrase &&
+      const same = syncConfig.syncId && syncConfig.syncId === await syncIdFor(v);
+      if (hasPass && !same &&
           !(await confirmDialog("Change the passphrase?", "Every browser has to use the new passphrase. The synced copy was encrypted with the old one – you can overwrite it from this browser afterwards.", "Change"))) return;
-      await chrome.storage.local.set({ syncConfig: { ...syncConfig, passphrase: v } });
-      toast("Passphrase saved");
-      syncToast(await runSync());
+      const { syncConfig: cur = {} } = await chrome.storage.local.get("syncConfig");
+      const next = { ...cur, ...(await rememberPassphrase(v)) };
+      delete next.passphrase;
+      markSaved();                                   // before storing: the page redraws right after
+      await chrome.storage.local.set({ syncConfig: next });
+      toast("Passphrase saved – only a hash of it is kept");
+      syncToast(await runSync(false, v));
     } } });
-    out.push(section("Passphrase", [
-      row("Passphrase", "Your workflows are encrypted with it before they leave this browser, so the storage can’t read them. Use the same one in Chrome, Brave, Helium… If you lose it, pick a new one and overwrite the synced copy.",
-        el("div", { className: "field-row" }, [pass, eye, savePass]))
+    const passRow = row("Passphrase", "Your workflows are encrypted with it before they leave this browser, so the storage can’t read them. Use the same one in Chrome, Brave, Helium… It isn’t stored: only hashes of it and the encryption key made from it (which can’t be exported). If you lose it, pick a new one and overwrite the synced copy.",
+      el("div", { className: "field-row" }, [pass, eye, savePass]));
+    if (focusPassNext) { focusPassNext = false; requestAnimationFrame(() => pass.focus()); }
+
+    // Every method is set up in the same order: connection, then the folder / token / address,
+    // and only once that's connected the passphrase below it. The rest shows when both are done.
+    const cfg = await unlockSyncConfig(await protectSyncConfig(syncConfig));   // decrypted only to fill the fields
+    const linked = await methodLinked(method, cfg);
+    const setup = !(linked && hasPass);
+    const cst = multiSyncStatus && multiSyncStatus.method === method ? multiSyncStatus : null;
+    out.push(section(SYNC_METHODS.find(m => m[0] === method)[1], [
+      setup ? connectionRow(null, linked ? "Not connected yet – choose your passphrase below." : "Not connected yet – " +
+        (method === "folder" ? "choose a folder below." : method === "gist" ? "paste your GitHub token below and press Connect." : "enter your server’s address below and press Connect."))
+            : connectionRow(cst, "Save a passphrase and press Connect.", method),
+      setup ? el("div", { className: "set-row muted", textContent: linked ? "Step 2 of 2 · Choose your sync passphrase."
+        : "Step 1 of 2 · " + (method === "folder" ? "Pick the folder to sync through." : method === "gist" ? "Connect your GitHub account." : "Connect your server.") }) : null,
+      ...(await methodRows(method, cfg)),
+      linked ? passRow : null].filter(Boolean)));
+    if (setup) return out;
+
+    out.push(section("Settings", [
+      row("Sync settings",
+        "Also sync your settings (theme, autosave, switching, sync timing…) with your other browsers that have this on. How each browser syncs, board zoom and column width stay per browser.",
+        switchCtl("syncSettings"))
     ]));
 
-    // Method settings
-    out.push(section(SYNC_METHODS.find(m => m[0] === method)[1], await methodRows(method, syncConfig)));
+    // When to sync (gist / server / webdav run in the background)
+    if (method !== "folder") {
+      out.push(section("Automatic sync", [
+        row("Sync every", "How often this browser checks for changes from your other browsers.",
+          selectCtl("syncInterval", [[1, "1 minute"], [2, "2 minutes"], [5, "5 minutes"], [10, "10 minutes"], [15, "15 minutes"], [30, "30 minutes"], [60, "1 hour"]])),
+        row("After a change", "How long to wait after you change something before it’s synced.",
+          selectCtl("syncDelay", [[0.5, "30 seconds"], [1, "1 minute"], [2, "2 minutes"], [5, "5 minutes"]])),
+        row("Apply changes when the browser starts",
+          "When this browser opens, check what your other browsers changed while it was closed – tabs removed, added or edited there are closed, opened or updated here. Off: the tabs this browser opens with win.",
+          switchCtl("syncApplyOnStartup"))
+      ]));
+    }
 
     // Status
     const st = multiSyncStatus && multiSyncStatus.method === method ? multiSyncStatus : null;
@@ -1085,14 +1266,15 @@ async function syncPage(section) {
         ])),
       el("div", { className: "set-row muted", textContent: method === "folder"
         ? "Syncs when this page opens, every 2 minutes while it’s open, and shortly after a change."
-        : "Syncs every 5 minutes and about 30 seconds after a change – even when this page is closed." })
+        : `Syncs every ${syncLabel(settings.syncInterval)} and ${syncLabel(settings.syncDelay)} after a change – even when this page is closed.` })
     ]));
     out.push(section("Good to know", [el("ul", { className: "good-to-know" }, [
       method === "folder" ? "Brave: folder access is off by default – turn on brave://flags/#file-system-access-api and restart Brave." : null,
       method === "folder" ? "The folder only syncs while this Session Manager page is open in that browser." : null,
       method === "server" ? "Your server finds your data by the passphrase itself: a typo starts a separate, empty sync instead of showing an error. The status warns you when a passphrase had nothing synced yet." : null,
-      "Your passphrase" + (method === "gist" ? " and GitHub token are" : method === "webdav" ? " and WebDAV password are" : " is") + " stored in this browser’s Tab Workflows data, so it can sync on its own. Anyone with access to this browser profile could read " + (method === "gist" || method === "webdav" ? "them" : "it") + ".",
+      "Your passphrase is never stored – only hashes of it and the encryption key made from it, which can’t be exported." + " Your " + (method === "gist" ? "GitHub token and gist id are" : method === "webdav" ? "WebDAV folder address, username and app password are" : method === "server" ? "server address is" : "folder name is") + " encrypted in this browser with a key that can’t be exported – they’re only decrypted while syncing.",
       "Each workflow keeps whichever version was changed most recently. Deleting a workflow deletes it everywhere.",
+      method === "folder" ? null : "A workflow that’s open in this browser follows changes made in another browser: its real tabs are closed, opened or moved to match.",
       "Unsorted tabs are combined: a tab removed in one browser can come back from another.",
       method === "folder" ? null : "The first time you connect, Chrome asks to let Tab Workflows reach that address – it’s needed to send and fetch the encrypted file."
     ].filter(Boolean).map(t => el("li", { textContent: t })))]));
@@ -1100,12 +1282,200 @@ async function syncPage(section) {
   return out;
 }
 
+// ---------- the passphrase field ----------
+// Empty: "Enter / Create passphrase". After a save: "Saved (encrypted)" for 5 s with the eye hidden,
+// then "Type for new passphrase"; the eye comes back as soon as you type. Kept outside the field
+// because saving redraws the Sync page.
+const PASS_SAVED_MS = 5000;
+let passSavedAt = 0;          // when a passphrase was last saved on this page
+function passphraseField() {
+  const pass = el("input", { type: "password", className: "field", value: "", autocomplete: "new-password" });
+  const eye = el("button", { className: "iconbtn flat", title: "Show / hide", html: svgIcon("eye", 15),
+    on: { click: () => { pass.type = pass.type === "password" ? "text" : "password"; } } });
+  const show = () => {
+    const left = passSavedAt ? PASS_SAVED_MS - (Date.now() - passSavedAt) : 0;
+    const typing = pass.value.length > 0;
+    pass.placeholder = left > 0 ? "Saved (encrypted)" : passSavedAt ? "Type for new passphrase" : "Enter / Create passphrase";
+    eye.classList.toggle("hidden", !!passSavedAt && !typing);
+    clearTimeout(timer);                           // per field (see secretField)
+    if (left > 0) timer = setTimeout(show, left + 30);
+  };
+  let timer;
+  pass.addEventListener("input", show);
+  show();
+  const markSaved = () => { passSavedAt = Date.now(); pass.value = ""; pass.type = "password"; pass.blur(); show(); };
+  return { pass, eye, markSaved };
+}
+
+// ---------- token / app password / username fields ----------
+// Saved (encrypted) as soon as you leave the field. A secret then shows "Saved (encrypted)" for 5 s and
+// afterwards dots, so it looks filled in; a username shows its first 3 letters and up to 5 stars (ale*****).
+// The times are kept outside the fields because saving redraws the Sync page.
+const SECRET_DOTS = "••••••••••••";
+const secretSavedAt = {};
+const maskName = name => {
+  const s = String(name || "");
+  const keep = s.length > 3 ? 3 : Math.min(1, s.length);
+  return s ? s.slice(0, keep) + "*".repeat(Math.min(5, Math.max(1, s.length - keep))) : "";
+};
+
+// `alsoOnChange`: fields to set together with a new value (e.g. a new token isn't checked yet).
+function secretField(key, isSaved, emptyPlaceholder, alsoOnChange = {}) {
+  const f = el("input", { type: "password", className: "field", value: "", spellcheck: false, autocomplete: "new-password" });
+  let pending = "", saving = Promise.resolve(), timer;
+  const show = () => {
+    const at = secretSavedAt[key] || 0;
+    const left = at ? PASS_SAVED_MS - (Date.now() - at) : 0;
+    f.placeholder = left > 0 ? "Saved (encrypted)" : (isSaved || at) ? SECRET_DOTS : emptyPlaceholder;
+    // Each field has its own timer: a redraw that's thrown away must not cancel the shown field's.
+    clearTimeout(timer);
+    if (left > 0) timer = setTimeout(show, left + 30);
+  };
+  f.addEventListener("blur", () => {
+    const v = f.value.trim();
+    if (!v) return;
+    pending = v;
+    f.value = "";
+    secretSavedAt[key] = Date.now();
+    saving = saveSyncFields({ ...alsoOnChange, [key]: v });
+    show();
+  });
+  show();
+  return { input: f, get: () => f.value.trim() || pending, saved: () => saving };
+}
+
+function usernameField(key, saved) {
+  const f = el("input", { type: "text", className: "field", value: "", spellcheck: false, autocomplete: "off",
+    placeholder: saved ? maskName(saved) : "Username" });
+  let pending = "", saving = Promise.resolve();
+  f.addEventListener("blur", () => {
+    const v = f.value.trim();
+    if (!v) return;
+    pending = v;
+    f.value = "";
+    f.placeholder = maskName(v);
+    saving = saveSyncFields({ [key]: v });
+  });
+  return { input: f, get: () => f.value.trim() || pending, saved: () => saving };
+}
+
+// ---------- WebDAV setup, step by step ----------
+// Set up = finished the steps once (webdavReady), or an older setup that already has a login and a passphrase.
+const webdavReady = cfg => !!(cfg.webdavReady || ((cfg.webdavUrlEnc || cfg.webdavUrl) && (cfg.webdavPassEnc || cfg.webdavPass) && (cfg.hasPassphrase || cfg.passphrase)));
+let webdavDraft = null;   // { step, url, user } while setting up (in memory; the login is saved at Connect)
+
+// Check the folder and the login before saving them. Returns "" when it works, else what's wrong.
+async function testWebdav(url, user, pass) {
+  const folder = /\.json$/i.test(url) ? url.replace(/[^/]*$/, "") : url.replace(/\/?$/, "/");
+  const bytes = new TextEncoder().encode(`${user}:${pass}`);
+  const auth = "Basic " + btoa(String.fromCharCode(...bytes));
+  let r;
+  try { r = await fetch(folder, { method: "PROPFIND", headers: { Authorization: auth, Depth: "0" }, cache: "no-store", credentials: "omit" }); }
+  catch (_) { return "Couldn’t reach that address – check it and your internet connection."; }
+  if (r.status === 401 || r.status === 403) return "The username or app password isn’t right.";
+  if (r.status === 404) return "That folder doesn’t exist – create it in your storage first.";
+  if (r.ok || r.status === 207 || r.status === 405) return "";
+  return `Your storage answered with error ${r.status}.`;
+}
+
+async function webdavSetupSection(section, syncConfig) {
+  const cfg = await unlockSyncConfig(await protectSyncConfig(syncConfig));
+  const loginSaved = !!(cfg.webdavUrl && cfg.webdavPass);
+  if (!webdavDraft) webdavDraft = { step: loginSaved ? 3 : 1, url: cfg.webdavUrl || "", user: cfg.webdavUser || "", focus: true };
+  const d = webdavDraft;
+  const goto = step => { d.step = step; d.focus = true; renderSettings(); };
+  const field = (value, placeholder, type = "text") => el("input", { type, className: "field", value: value || "", placeholder, spellcheck: false, autocomplete: type === "password" ? "new-password" : "off" });
+  const onEnter = (input, fn) => input.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); fn(); } });
+  const busy = async (btn, fn) => { btn.disabled = true; try { await fn(); } finally { btn.disabled = false; } };
+  const done = text => el("span", { className: "conn-pill on" }, [el("span", { className: "conn-dot" }), text]);
+  const rows = [];
+
+  rows.push(el("div", { className: "set-row muted", textContent: `Step ${d.step} of 3 · ` +
+    ["Enter your WebDAV folder address.", "Log in to your storage.", "Choose your sync passphrase."][d.step - 1] }));
+
+  // 1 · Folder address
+  if (d.step === 1) {
+    const url = field(d.url, "https://cloud.example.com/remote.php/dav/files/you/TabWorkflows/");
+    const next = el("button", { className: "btn sm primary", textContent: "Next", on: { click: () => {
+      const v = url.value.trim();
+      if (!/^https?:\/\//i.test(v)) { toast("Enter the full folder address, starting with https://"); url.focus(); return; }
+      d.url = v;
+      goto(2);
+    } } });
+    onEnter(url, () => next.click());
+    rows.push(row("Folder address", "A WebDAV folder that already exists (Nextcloud: Settings → WebDAV shows it). The file " + SYNC_FILE + " is created in it.",
+      el("div", { className: "field-row" }, [url, next])));
+    if (d.focus) requestAnimationFrame(() => url.focus());
+  } else {
+    rows.push(row("Folder address", d.url, el("button", { className: "btn sm", textContent: "Change", on: { click: () => goto(1) } })));
+  }
+
+  // 2 · Username & app password → Connect (asks for permission, then checks the login)
+  if (d.step === 2) {
+    const userF = usernameField("webdavUser", cfg.webdavUser);
+    const passF = secretField("webdavPass", !!cfg.webdavPass, "App password");
+    const user = userF.input, pass = passF.input;
+    const connect = el("button", { className: "btn sm primary", textContent: "Connect" });
+    connect.addEventListener("click", () => busy(connect, async () => {
+      d.user = userF.get() || cfg.webdavUser || "";
+      const p = passF.get() || cfg.webdavPass || "";
+      if (!d.user) { toast("Enter your username"); user.focus(); return; }
+      if (!p) { toast("Enter your app password"); pass.focus(); return; }
+      if (!(await askHostAccess([d.url]))) { toast("Tab Workflows needs your OK to reach your WebDAV storage"); return; }
+      await Promise.all([userF.saved(), passF.saved()]);
+      connect.textContent = "Connecting…";
+      const problem = await testWebdav(d.url, d.user, p);
+      connect.textContent = "Connect";
+      if (problem) { toast(problem); return; }
+      await saveSyncFields({ webdavUrl: d.url, webdavUser: d.user, webdavPass: p, webdavReady: null });
+      toast("Connected to your WebDAV storage");
+      goto(3);
+    }));
+    onEnter(user, () => pass.focus());
+    onEnter(pass, () => connect.click());
+    rows.push(row("Username & app password", "Use an app password if your storage offers one. Connecting asks your OK to reach this address.",
+      el("div", { className: "field-row" }, [user, pass, connect])));
+    if (d.focus) requestAnimationFrame(() => (cfg.webdavUser ? pass : user).focus());
+  } else if (d.step > 2) {
+    rows.push(row("Login", maskName(d.user), el("div", { className: "row-btns" }, [done("Connected"),
+      el("button", { className: "btn sm", textContent: "Change", on: { click: () => goto(2) } })])));
+  }
+
+  // 3 · Passphrase → Save (finishes the setup and syncs)
+  if (d.step === 3) {
+    const hasPass = !!(syncConfig.hasPassphrase || syncConfig.passphrase);
+    const { pass, eye, markSaved } = passphraseField();
+    const save = el("button", { className: "btn sm primary", textContent: "Save" });
+    save.addEventListener("click", () => busy(save, async () => {
+      const v = pass.value;
+      if (v || !hasPass) {
+        if (v.length < 8) { toast("Use at least 8 characters"); pass.focus(); return; }
+        if (hasPass && syncConfig.syncId !== await syncIdFor(v) &&
+            !(await confirmDialog("Change the passphrase?", "Every browser has to use the new passphrase. The synced copy was encrypted with the old one – you can overwrite it from this browser afterwards.", "Change"))) return;
+        const { syncConfig: cur = {} } = await chrome.storage.local.get("syncConfig");
+        const next = { ...cur, ...(await rememberPassphrase(v)) };
+        delete next.passphrase;
+        markSaved();                                 // the full Sync page then shows "Saved (encrypted)"
+        await chrome.storage.local.set({ syncConfig: next });
+      }
+      await saveSyncFields({ webdavReady: true });
+      webdavDraft = null;
+      toast("WebDAV sync is set up");
+      syncToast(await runSync(false, v));
+    }));
+    onEnter(pass, () => save.click());
+    rows.push(row("Passphrase", "Your workflows are encrypted with it before they leave this browser, so your storage can’t read them. Use the same one in Chrome, Brave, Helium… It isn’t stored: only hashes of it and the encryption key made from it.",
+      el("div", { className: "field-row" }, [pass, eye, save])));
+    if (d.focus) requestAnimationFrame(() => pass.focus());
+  }
+
+  d.focus = false;   // focus the new step's field once, not on every redraw (saving a field redraws)
+  return section("WebDAV", [d.step < 3 ? connectionRow(null, "Not connected yet – finish the steps below.") : null, ...rows].filter(Boolean));
+}
+
 async function methodRows(method, cfg) {
   const input = (value, placeholder, type = "text") => el("input", { type, className: "field", value: value || "", placeholder, spellcheck: false, autocomplete: "off" });
-  const save = async patch => {
-    const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
-    await chrome.storage.local.set({ syncConfig: { ...syncConfig, ...patch } });
-  };
+  const save = patch => saveSyncFields(patch);   // addresses, logins and ids are stored encrypted
 
   if (method === "folder") {
     const handle = await idbGet("syncFolder").catch(() => null);
@@ -1122,15 +1492,22 @@ async function methodRows(method, cfg) {
   }
 
   if (method === "gist") {
-    const token = input(cfg.gistToken, "ghp_… or github_pat_…", "password");
+    const tok = secretField("gistToken", !!cfg.gistToken, "ghp_… or github_pat_…", { gistVerified: null });
+    const token = tok.input;
     return [
       row("GitHub token", "A token that may only create and edit gists. Create one (tick just “gist”), copy it here, and use the same token in each browser.",
         el("div", { className: "field-row" }, [token,
           el("button", { className: "btn sm", textContent: "Create token", on: { click: () => window.open("https://github.com/settings/tokens/new?scopes=gist&description=Tab%20Workflows%20sync", "_blank") } }),
           el("button", { className: "btn sm primary", textContent: "Connect", on: { click: async () => {
             if (!(await askHostAccess(["https://api.github.com/", "https://gist.githubusercontent.com/"]))) { toast("Tab Workflows needs access to GitHub to sync"); return; }
-            await save({ gistToken: token.value.trim() });
-            syncToast(await runSync());
+            const t = tok.get() || cfg.gistToken || "";
+            await tok.saved();                       // leaving the field (to click here) saves it
+            if (!t) { toast("Paste your GitHub token first"); return; }
+            const problem = await testGistToken(t);
+            if (problem) { toast(problem); return; }
+            await save({ gistToken: t, gistVerified: true });
+            secretSavedAt.gistToken = 1;             // connected: show the dots right away
+            await afterConnect("Connected to GitHub");
           } } })])),
       cfg.gistId ? el("div", { className: "set-row muted", textContent: `Using gist ${cfg.gistId} (private, file ${SYNC_FILE}).` }) : null
     ].filter(Boolean);
@@ -1166,7 +1543,7 @@ async function methodRows(method, cfg) {
             if (!/^https?:\/\//i.test(v)) { toast("Enter the full address, starting with https://"); return; }
             if (!(await askHostAccess([v]))) { toast("Tab Workflows needs access to your server to sync"); return; }
             await save({ serverUrl: v });
-            syncToast(await runSync());
+            await afterConnect("Server saved");
           } } })])),
       help
     ];
@@ -1174,8 +1551,9 @@ async function methodRows(method, cfg) {
 
   // webdav
   const url = input(cfg.webdavUrl, "https://cloud.example.com/remote.php/dav/files/you/TabWorkflows/");
-  const user = input(cfg.webdavUser, "Username");
-  const pass = input(cfg.webdavPass, "App password", "password");
+  const userF = usernameField("webdavUser", cfg.webdavUser);
+  const passF = secretField("webdavPass", !!cfg.webdavPass, "App password");
+  const user = userF.input, pass = passF.input;
   return [
     row("Folder address", "A WebDAV folder that already exists (Nextcloud: Settings → WebDAV shows it). The file " + SYNC_FILE + " is created in it.", url),
     row("Username & app password", "Use an app password if your storage offers one.", el("div", { className: "field-row" }, [user, pass,
@@ -1183,7 +1561,11 @@ async function methodRows(method, cfg) {
         const v = url.value.trim();
         if (!/^https?:\/\//i.test(v)) { toast("Enter the full folder address, starting with https://"); return; }
         if (!(await askHostAccess([v]))) { toast("Tab Workflows needs access to your WebDAV storage to sync"); return; }
-        await save({ webdavUrl: v, webdavUser: user.value.trim(), webdavPass: pass.value });
+        const u = userF.get() || cfg.webdavUser || "", p = passF.get() || cfg.webdavPass || "";
+        await Promise.all([userF.saved(), passF.saved()]);   // leaving a field (to click here) saves it
+        if (!p) { toast("Enter your app password"); return; }
+        secretSavedAt.webdavPass = 1;                 // connected: show the dots right away
+        await save({ webdavUrl: v, webdavUser: u, webdavPass: p });
         syncToast(await runSync());
       } } })]))
   ];
@@ -1192,6 +1574,7 @@ async function methodRows(method, cfg) {
 async function chromeSyncSection(section, syncStatus) {
   const info = (await send("syncInfo")).result;
   return section("Chrome profile", [
+    connectionRow(syncStatus, "Turns on a minute after your next change.", "chrome"),
     row("Status", syncStatus && !syncStatus.ok ? syncStatus.error
       : syncStatus ? `Last synced ${timeAgo(syncStatus.at)} · ${(syncStatus.size / 1024).toFixed(1)} KB of about 90 KB`
       : "Syncing shortly.", el("button", { className: "btn sm", html: svgIcon("upload", 14) + "Sync now", on: { click: async () => {
@@ -1242,20 +1625,19 @@ async function chooseSyncFolder() {
   try { handle = await window.showDirectoryPicker({ id: "tab-workflows-sync", mode: "readwrite" }); }
   catch (_) { return; }   // cancelled
   await idbSet("syncFolder", handle);
-  const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
-  await chrome.storage.local.set({ syncConfig: { ...syncConfig, folderName: handle.name } });
-  syncToast(await folderSyncNow({ ask: true }));
-  renderSettings();
+  await saveSyncFields({ folderName: handle.name });
+  if (await hasSyncPassphrase()) { syncToast(await folderSyncNow({ ask: true })); renderSettings(); }
+  else await afterConnect(`Folder “${handle.name}” chosen`);
 }
 
 let folderSyncing = false;
-async function folderSyncNow({ ask = false, force = false } = {}) {
+async function folderSyncNow({ ask = false, force = false, passphrase = "" } = {}) {
   if (settings.syncMethod !== "folder" || folderSyncing) return null;
   const status = async st => { const s = { at: Date.now(), method: "folder", ...st }; await chrome.storage.local.set({ multiSyncStatus: s }); return s; };
   const handle = await idbGet("syncFolder").catch(() => null);
   if (!handle) return status({ ok: false, error: "Choose a folder first." });
-  const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
-  if (!syncConfig.passphrase) return status({ ok: false, error: "Set a passphrase first." });
+  const syncConfig = await protectSyncConfig((await chrome.storage.local.get("syncConfig")).syncConfig || {});
+  if (!syncConfig.hasPassphrase) return status({ ok: false, error: "Set a passphrase first." });
   folderSyncing = true;
   try {
     let perm = await handle.queryPermission({ mode: "readwrite" });
@@ -1266,7 +1648,7 @@ async function folderSyncNow({ ask = false, force = false } = {}) {
       try { text = await (await (await handle.getFileHandle(SYNC_FILE)).getFile()).text(); }
       catch (e) { if (e.name !== "NotFoundError") throw e; }
     }
-    const remote = text ? await openSync(text, syncConfig.passphrase) : null;
+    const remote = text ? await openSyncStored(text, syncConfig, passphrase) : null;
     const res = await send("syncMergeRemote", { remote: force ? null : remote });
     if (!res.ok) throw new Error(res.error);
     const payload = res.result;
@@ -1274,7 +1656,7 @@ async function folderSyncNow({ ask = false, force = false } = {}) {
     if (force || !remote || !sameSyncContent(remote, payload)) {
       const fh = await handle.getFileHandle(SYNC_FILE, { create: true });
       const w = await fh.createWritable();
-      await w.write(await sealSync(payload, syncConfig.passphrase));
+      await w.write(await sealSyncStored(payload, syncConfig));
       await w.close();
       uploaded = true;
     }
@@ -1332,29 +1714,88 @@ function applyView() {
   if (z) z.textContent = Math.round(canvas.zoom * 100) + "%";
 }
 
-// Place cards that don't have a spot yet in tidy columns next to the ones you've placed.
+// Place cards that don't have a spot yet, and make sure no two workflows overlap.
+// `cards` comes oldest first (sortedWorkflows), so when two overlap the newer one moves to a free spot.
 function layoutCanvas(cards) {
   const COLW = 360, GAP = 20, COLS = 4;
-  const unplaced = cards.filter(c => !canvas.pos[c.dataset.id]);
-  if (unplaced.length) {
-    const placed = cards.filter(c => canvas.pos[c.dataset.id]);
-    const baseX = placed.length ? Math.max(...placed.map(c => canvas.pos[c.dataset.id].x + 340)) + 40 : 24;
-    const colY = Array(COLS).fill(24);
-    for (const c of unplaced) {
-      const col = colY.indexOf(Math.min(...colY));
-      canvas.pos[c.dataset.id] = { x: baseX + col * COLW, y: colY[col], z: ++zTop };
-      colY[col] += (c.offsetHeight || 120) + GAP;
-    }
-    saveCanvas();
-  }
-  for (const c of cards) {
+  const apply = c => {
     const p = canvas.pos[c.dataset.id];
     c.style.left = p.x + "px";
     c.style.top = p.y + "px";
     c.style.zIndex = p.z || 1;
     if (p.w) c.style.width = p.w + "px";
     if (p.h) c.style.height = p.h + "px";
+  };
+  const placed = cards.filter(c => canvas.pos[c.dataset.id]);
+  const unplaced = cards.filter(c => !canvas.pos[c.dataset.id]);
+  placed.forEach(apply);
+  // Real sizes (the card is in the page now); hidden cards (search) fall back to their saved or default size.
+  const size = c => {
+    const p = canvas.pos[c.dataset.id] || {};
+    return { w: c.offsetWidth || p.w || 340, h: c.offsetHeight || p.h || 120 };
+  };
+  const rectOf = c => ({ c, x: canvas.pos[c.dataset.id].x, y: canvas.pos[c.dataset.id].y, ...size(c) });
+  const hits = (a, b, gap) => a.x < b.x + b.w + gap && b.x < a.x + a.w + gap && a.y < b.y + b.h + gap && b.y < a.y + a.h + gap;
+  // The free spot closest to (tx, ty): right of / below the existing cards, or at the target itself.
+  const freeSpot = (w, h, rects, tx, ty) => {
+    const xs = new Set([Math.round(tx)]), ys = new Set([Math.round(ty)]);
+    for (const r of rects) { xs.add(r.x + r.w + GAP); xs.add(r.x); ys.add(r.y + r.h + GAP); ys.add(r.y); }
+    let best = null, bestD = Infinity;
+    for (const x of xs) for (const y of ys) {
+      const cand = { x, y, w, h };
+      if (rects.some(r => hits(cand, r, GAP - 1))) continue;
+      const d = Math.hypot(x - tx, (y - ty) * 1.5);
+      if (d < bestD) { bestD = d; best = cand; }
+    }
+    // There is always a spot right of everything.
+    return best || { x: Math.max(...rects.map(r => r.x + r.w)) + GAP, y: Math.round(ty), w, h };
+  };
+
+  let changed = false;
+  if (unplaced.length && !placed.length) {
+    // Nothing placed yet (first time, or "Tidy up"): tidy columns.
+    const colY = Array(COLS).fill(24);
+    for (const c of unplaced) {
+      const col = colY.indexOf(Math.min(...colY));
+      canvas.pos[c.dataset.id] = { x: 24 + col * COLW, y: colY[col], z: ++zTop };
+      apply(c);
+      colY[col] += size(c).h + GAP;
+    }
+    changed = true;
+  } else if (unplaced.length) {
+    // New workflows go to the free spot nearest the top-left of what you're looking at.
+    const rects = placed.map(rectOf);
+    const tx = -canvas.x / canvas.zoom + 24, ty = -canvas.y / canvas.zoom + 24;
+    for (const c of unplaced) {
+      canvas.pos[c.dataset.id] = { x: 0, y: 0, z: ++zTop };
+      apply(c);                                   // so its real size can be measured
+      const s = size(c);
+      const spot = freeSpot(s.w, s.h, rects, tx, ty);
+      canvas.pos[c.dataset.id].x = spot.x;
+      canvas.pos[c.dataset.id].y = spot.y;
+      apply(c);
+      rects.push(rectOf(c));
+    }
+    changed = true;
   }
+
+  // Overlaps left over (a card grew, a workflow arrived through sync…): the newer workflow moves out.
+  // Only when the cards can be measured (the canvas is on screen).
+  if (cards.some(c => c.offsetWidth > 0)) {
+    const done = [];
+    for (const c of cards) {
+      const r = rectOf(c);
+      if (c.offsetWidth > 0 && done.some(o => hits(r, o, 0))) {
+        const spot = freeSpot(r.w, r.h, done, r.x, r.y);
+        canvas.pos[c.dataset.id].x = spot.x;
+        canvas.pos[c.dataset.id].y = spot.y;
+        apply(c);
+        done.push(rectOf(c));
+        changed = true;
+      } else done.push(r);
+    }
+  }
+  if (changed) saveCanvas();
 }
 
 function zoomAt(clientX, clientY, factor) {
@@ -1664,16 +2105,54 @@ function enableCanvasPan() {
     if (settings.display !== "canvas") return;
     // Over a workflow the wheel belongs to that workflow: it scrolls its tabs (if they overflow)
     // and never moves the canvas – not even at the top or bottom. Scroll outside workflows to move around.
+    // Over a workflow whose tabs can scroll, the wheel scrolls its tabs (and never moves the canvas).
+    // Over a workflow with nothing to scroll, the wheel moves the canvas as if the workflow wasn't there.
     if (!e.ctrlKey && !e.metaKey && e.target.closest && e.target.closest(".canvas-world .card")) {
-      const body = e.target.closest(".card-body");
-      if (!(body && body.scrollHeight > body.clientHeight + 1)) e.preventDefault();
-      return;   // scrollable list: the browser scrolls it (overscroll-behavior keeps it from spilling over)
+      const body = e.target.closest(".card").querySelector(".card-body");
+      if (body && body.scrollHeight > body.clientHeight + 1) {
+        if (e.target.closest(".card-body")) return;          // the browser scrolls the list
+        e.preventDefault();                                  // header / footer: scroll the list too
+        body.scrollTop += e.deltaY;
+        return;
+      }
     }
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
     else { canvas.x -= e.deltaX; canvas.y -= e.deltaY; applyView(); saveCanvas(); }
   }, { passive: false });
 }
+
+// Hold the mouse wheel (middle button) and drag to move around – anywhere, also on top of a workflow.
+// Canvas: moves the canvas. Board / List: scrolls the page.
+document.addEventListener("pointerdown", e => {
+  if (e.button !== 1 || $("boardView").classList.contains("hidden") || !$("modal").classList.contains("hidden")) return;
+  if (!e.target.closest || !e.target.closest("#boardView")) return;
+  e.preventDefault();                               // no browser autoscroll circle
+  e.stopPropagation();
+  const board = $("board");
+  const canvasMode = settings.display === "canvas";
+  const sx = e.clientX, sy = e.clientY, ox = canvas.x, oy = canvas.y, scrollX0 = window.scrollX, scrollY0 = window.scrollY;
+  board.classList.add("panning");
+  document.body.classList.add("mid-panning");
+  const move = ev => {
+    if (canvasMode) { canvas.x = ox + ev.clientX - sx; canvas.y = oy + ev.clientY - sy; applyView(); }
+    else window.scrollTo(scrollX0 - (ev.clientX - sx), scrollY0 - (ev.clientY - sy));
+  };
+  const up = ev => {
+    if (ev.type === "pointerup" && ev.button !== 1) return;
+    window.removeEventListener("pointermove", move, true);
+    window.removeEventListener("pointerup", up, true);
+    window.removeEventListener("pointercancel", up, true);
+    board.classList.remove("panning");
+    document.body.classList.remove("mid-panning");
+    if (canvasMode) saveCanvas();
+  };
+  window.addEventListener("pointermove", move, true);
+  window.addEventListener("pointerup", up, true);
+  window.addEventListener("pointercancel", up, true);
+}, true);
+document.addEventListener("mousedown", e => { if (e.button === 1 && e.target.closest && e.target.closest("#boardView")) e.preventDefault(); }, true);
+document.addEventListener("auxclick", e => { if (e.button === 1 && e.target.closest && e.target.closest("#boardView")) e.preventDefault(); }, true);
 
 // Keep the canvas below the (wrapping) top bar.
 new ResizeObserver(() => {
@@ -1860,6 +2339,128 @@ function cardExtras(wf) {
   return out;
 }
 
+// ---------- dividers ----------
+// Divider tab: a tiny page of this extension in the tab strip (divider.html#t=Text&c=colour).
+// Label: only shown here, above a tab (stored as `section` on that tab).
+const DIVIDER_RE = /^chrome-extension:\/\/[a-z]{32}\/divider\.html/i;
+const DIVIDER_COLORS = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
+const isDividerTab = t => DIVIDER_RE.test((t && t.url) || "");
+function dividerOf(url) {
+  const p = new URLSearchParams(String(url || "").split("#")[1] || "");
+  const c = p.get("c");
+  return { text: p.get("t") || "", color: DIVIDER_COLORS.includes(c) ? c : "grey" };
+}
+
+function labelRow(wf, wi, ti, sec) {
+  return el("li", { className: "label-row", "data-gcolor": sec.color || "grey", title: "Label – only shown here, not a tab" }, [
+    el("span", { className: "lbl-text", textContent: sec.text || "Section" }),
+    el("span", { className: "div-line" }),
+    el("div", { className: "row-actions" }, [
+      el("button", { title: "Change text and colour", html: svgIcon("edit", 13), on: { click: async () => {
+        const r = await dividerDialog({ title: "Edit label", text: sec.text, color: sec.color, kind: "label" });
+        if (r) send("editDivider", { id: wf.id, win: wi, idx: ti, text: r.text, color: r.color, kind: "label" });
+      } } }),
+      el("button", { className: "rm", title: "Remove label", html: svgIcon("close", 13), on: { click: async () => {
+        await send("removeLabel", { id: wf.id, win: wi, idx: ti });
+        toast("Removed a label", undoAction);
+      } } })
+    ])
+  ]);
+}
+
+// `idx` undefined = at the end. `chooseKind`: offer "label" too (needs a tab below it).
+async function addDividerFlow(wf, wi, idx, chooseKind = true) {
+  const r = await dividerDialog({ title: "Add divider", text: "", color: "grey", kind: "tab", chooseKind: chooseKind && idx !== undefined });
+  if (!r) return;
+  const res = await send("addDivider", { id: wf.id, win: wi, idx, text: r.text, color: r.color, kind: r.kind });
+  if (!res.ok) return toast("Couldn’t add the divider: " + res.error);
+  toast(r.kind === "label" ? "Label added" : isLive(wf) ? "Divider tab added – it’s asleep" : "Divider tab added", undoAction);
+}
+
+function dividerDialog({ title, text = "", color = "grey", kind = "tab", chooseKind = false }) {
+  return new Promise(resolve => {
+    const m = $("modal");
+    const textIn = el("input", { type: "text", value: text, placeholder: "Text (optional), e.g. Work", maxLength: 80 });
+    let pick = DIVIDER_COLORS.includes(color) ? color : "grey";
+    const sw = el("div", { className: "color-swatches" });
+    const paintSw = () => sw.replaceChildren(...DIVIDER_COLORS.map(c => el("button", {
+      type: "button", className: "dswatch" + (c === pick ? " on" : ""), "data-gcolor": c,
+      title: c[0].toUpperCase() + c.slice(1), "aria-label": c, on: { click: () => { pick = c; paintSw(); paintPreview(); } } })));
+    const preview = el("div", { className: "divider-preview" });
+    const paintPreview = () => {
+      preview.dataset.gcolor = pick;
+      preview.replaceChildren(el("span", { className: "div-line" }), el("span", { className: "div-text", textContent: textIn.value.trim() || "Divider" }), el("span", { className: "div-line" }));
+    };
+    let k = kind;
+    const kinds = [
+      ["tab", "Divider tab", "Shows in the browser’s tab strip. Sleeps when you’re not on it, so it costs almost no memory."],
+      ["label", "Label", "Only shown here, above this tab. Not a tab at all – zero memory."]
+    ];
+    const kindBox = el("div", { className: "kind-pick" });
+    const paintKinds = () => kindBox.replaceChildren(...kinds.map(([v, l, d]) => el("button", {
+      type: "button", className: "kind" + (v === k ? " on" : ""), on: { click: () => { k = v; paintKinds(); } } }, [
+      el("span", { className: "kind-name", textContent: l }), el("span", { className: "kind-desc", textContent: d })])));
+    paintSw(); paintPreview(); paintKinds();
+    textIn.addEventListener("input", paintPreview);
+    const done = v => { closeModal(); resolve(v); };
+    const ok = () => done({ text: textIn.value.trim(), color: pick, kind: k });
+    textIn.addEventListener("keydown", e => { if (e.key === "Enter") ok(); });
+    const label = (txt, ctl) => el("label", { className: "field-col" }, [el("span", { textContent: txt }), ctl]);
+    m.innerHTML = "";
+    m.append(el("div", { className: "dialog", role: "dialog", "aria-modal": "true" }, [
+      el("h2", { textContent: title }),
+      preview,
+      chooseKind ? el("div", { className: "field-col" }, [el("span", { textContent: "Type" }), kindBox]) : null,
+      label("Text", textIn),
+      el("div", { className: "field-col" }, [el("span", { textContent: "Colour" }), sw]),
+      el("div", { className: "buttons" }, [
+        el("button", { className: "btn ghost", textContent: "Cancel", on: { click: () => done(null) } }),
+        el("button", { className: "btn primary", textContent: "Save", on: { click: ok } })
+      ])
+    ]));
+    m.classList.remove("hidden");
+    m.onmousedown = e => { if (e.target === m) done(null); };
+    m._cancel = () => done(null);
+    setTimeout(() => textIn.focus(), 0);
+  });
+}
+
+// ---------- backup copies of one workflow ----------
+async function copiesDialog(wf) {
+  const { wfCopies = {} } = await chrome.storage.local.get("wfCopies");
+  const list = wfCopies[wf.id] || [];
+  const m = $("modal");
+  const done = () => closeModal();
+  const items = list.length ? list.map((c, i) => {
+    const tabs = (c.windows || []).flatMap(w => w.tabs || []);
+    const sample = tabs.filter(t => !isDividerTab(t)).slice(0, 3).map(t => t.name || t.title || hostOf(t.url)).join(", ");
+    return el("div", { className: "backup-item" }, [
+      el("span", { className: "tile sm", html: svgIcon(resolveIcon(c.icon || wf.icon), 15) }),
+      el("div", { className: "set-text" }, [
+        el("div", { className: "set-label", textContent: fmtDate(c.at) + (c.name && c.name !== wf.name ? ` · “${c.name}”` : "") }),
+        el("div", { className: "set-desc", textContent: plural(tabs.length, "tab") + (sample ? " · " + sample + (tabs.length > 3 ? "…" : "") : "") })
+      ]),
+      el("button", { className: "btn sm", html: svgIcon("undo", 14) + "Restore", on: { click: async () => {
+        done();
+        if (!(await confirmDialog(`Restore this copy of “${wf.name}”?`,
+          `Its tabs go back to how they were on ${fmtDate(c.at)}.` + (isLive(wf) ? " It’s open right now, so your real tabs change too." : "") + " The tabs it has now are kept as a backup copy, and you can undo this.", "Restore"))) return;
+        const r = await send("restoreWorkflowCopy", { id: wf.id, index: i });
+        toast(r.ok ? `Restored ${plural(r.result, "tab")}` : "Couldn’t restore: " + r.error, r.ok ? undoAction : null);
+      } } })
+    ]);
+  }) : [el("div", { className: "set-desc", textContent: "No copies yet. A copy is kept the next time this workflow’s tabs change." })];
+  m.innerHTML = "";
+  m.append(el("div", { className: "dialog", role: "dialog", "aria-modal": "true" }, [
+    el("h2", { textContent: "Backup copies" }),
+    el("p", { textContent: `The last 3 earlier versions of “${wf.name}”, kept in this browser. A new copy is taken when its tabs change (at most every 30 minutes – right away when many tabs disappear at once).` }),
+    el("div", { className: "backup-list" }, items),
+    el("div", { className: "buttons" }, [el("button", { className: "btn primary", textContent: "Close", on: { click: done } })])
+  ]));
+  m.classList.remove("hidden");
+  m.onmousedown = e => { if (e.target === m) done(); };
+  m._cancel = done;
+}
+
 // ---------- Chrome tab group header inside a card ----------
 function groupHeader(g, count) {
   return el("li", { className: "group-row", "data-gcolor": g.color || "grey" }, [
@@ -1956,18 +2557,48 @@ function setView(v) {
   $("historyView").classList.toggle("hidden", v !== "history");
   if (v === "history") renderHistory();
   document.querySelectorAll(".views button").forEach(b => b.classList.toggle("on", b.dataset.view === v));
+  moveSlider(document.querySelector(".views"));
+  moveSlider($("displaySeg"));            // hidden outside Workflows: placed again when it shows
   if (location.hash !== "#" + v) { try { history.replaceState(null, "", "#" + v); } catch (_) {} }
   if (v === "settings") renderSettings();
   else if (typeof applyBoardWidth === "function") applyBoardWidth();
 }
 
+// A highlight that slides from the selected button to the one you click (Workflows / History / Settings,
+// and Board / List / Canvas). It lives in the container, so it survives the buttons being rebuilt.
+// `memo`: a name for a container that is rebuilt from scratch (the Settings menu) – the new highlight
+// then starts where the old one was and slides from there.
+const sliderAt = {};
+function moveSlider(box, memo) {
+  if (!box) return;
+  let s = box.querySelector(":scope > .seg-slider");
+  const first = !s;
+  if (first) { s = el("span", { className: "seg-slider", "aria-hidden": "true" }); box.prepend(s); box.classList.add("has-slider"); }
+  const on = box.querySelector(":scope > button.on");
+  if (!on || !on.offsetWidth) { s.style.opacity = "0"; return; }   // not on screen yet: placed when it is
+  const place = p => { s.style.width = p.w + "px"; s.style.height = p.h + "px"; s.style.transform = `translate(${p.x}px, ${p.y}px)`; };
+  const to = { x: on.offsetLeft, y: on.offsetTop, w: on.offsetWidth, h: on.offsetHeight };
+  if (first || s.style.opacity === "0") {
+    s.style.transition = "none";
+    s.style.opacity = "1";
+    const from = first && memo && sliderAt[memo];
+    if (from) { place(from); void s.offsetWidth; s.style.transition = ""; place(to); }
+    else { place(to); void s.offsetWidth; s.style.transition = ""; }
+  } else place(to);
+  if (memo) sliderAt[memo] = to;
+}
+const moveAllSliders = () => document.querySelectorAll(".has-slider").forEach(moveSlider);
+window.addEventListener("resize", moveAllSliders);
+document.fonts?.ready.then(moveAllSliders).catch(() => {});
+
 function renderDisplaySeg() {
   const seg = $("displaySeg");
-  seg.innerHTML = "";
+  seg.querySelectorAll(":scope > button").forEach(b => b.remove());
   for (const [v, icon, label] of [["board", "board", "Board"], ["list", "list", "List"], ["canvas", "canvas", "Canvas"]]) {
     seg.append(el("button", { type: "button", title: label, className: settings.display === v ? "on" : "", html: svgIcon(icon, 14),
       on: { click: () => setSetting("display", v) } }));
   }
+  moveSlider(seg);
   document.body.classList.toggle("display-list", settings.display === "list");
   document.body.classList.toggle("display-canvas", settings.display === "canvas");
 }
@@ -1989,6 +2620,7 @@ chrome.storage.onChanged.addListener((ch, area) => {
   const typingInSettings = $("settings").contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
   if ((ch.backups || ch.syncStatus || ch.multiSyncStatus || ch.syncConfig) && !$("settingsView").classList.contains("hidden") && !typingInSettings) renderSettings();
   if (ch.workflows || ch.looseTabs || ch.tombstones) scheduleFolderSync();
+  if (ch.updateNotice) maybeShowUpdate();
 });
 
 let folderSyncStarted = false;
@@ -1998,6 +2630,7 @@ onSettings(s => {
     || s.display !== settings.display || s.switchMode !== settings.switchMode;
   settings = s;
   renderDisplaySeg();
+  paintPaletteBtn();
   if (!movingCard) {
     if (typeof s.boardZoom === "number" && s.boardZoom !== boardZoom && !boardZoomSave) boardZoom = clampZoom(s.boardZoom);
     applyBoardZoom();
@@ -2020,7 +2653,12 @@ $("emptyBoard").append(
 $("addBtn").addEventListener("click", newWorkflow);
 $("undoBtn").innerHTML = svgIcon("undo", 16);
 $("undoBtn").addEventListener("click", doUndo);
-$("paletteBtn").innerHTML = svgIcon("command", 15) + "<kbd>Ctrl K</kbd>";
+function paintPaletteBtn() {
+  $("paletteBtn").innerHTML = svgIcon("command", 15);
+  $("paletteBtn").append(el("kbd", { textContent: hotkeyLabel(hotkeys().palette) }));
+  $("paletteBtn").title = `Command palette (${hotkeyLabel(hotkeys().palette)})`;
+}
+paintPaletteBtn();
 $("paletteBtn").addEventListener("click", () => managerPalette());
 $("tagFilter").addEventListener("change", e => { tagFilter = e.target.value; refreshTagFilter(); renderBoard(); });
 $("newTabBtn").innerHTML = svgIcon("plus", 17);
@@ -2037,10 +2675,12 @@ document.querySelectorAll(".views button").forEach(b => b.addEventListener("clic
 window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
 
 document.addEventListener("keydown", e => {
+  if (recordingHotkey) return;
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
-  const mod = e.ctrlKey || e.metaKey;
-  if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); if ($("modal").classList.contains("hidden")) managerPalette(); return; }
-  if (mod && !e.shiftKey && e.key.toLowerCase() === "z" && !typing && $("modal").classList.contains("hidden") && !paletteEl) {
+  const combo = comboFromEvent(e);
+  const hk = hotkeys();
+  if (combo && combo === hk.palette && (combo.includes("+") || !typing)) { e.preventDefault(); if ($("modal").classList.contains("hidden")) managerPalette(); return; }
+  if (combo && combo === hk.undo && !typing && $("modal").classList.contains("hidden") && !paletteEl) {
     e.preventDefault(); doUndo(); return;
   }
   if (e.key === "Escape") {
@@ -2050,7 +2690,7 @@ document.addEventListener("keydown", e => {
     if (selection.size) { selection.clear(); renderBoard(); return; }
     if (document.activeElement === $("search") && query) { $("search").value = ""; query = ""; renderBoard(); }
   }
-  if (e.key === "/" && !typing && $("modal").classList.contains("hidden")) {
+  if (combo && combo === hk.search && (combo.includes("+") || !typing) && $("modal").classList.contains("hidden")) {
     e.preventDefault();
     setView("board");
     $("search").focus();
@@ -2062,3 +2702,208 @@ renderDisplaySeg();
 setView(location.hash.slice(1) || "board");
 updateUndoBtn();
 load();
+
+// ---------- welcome & update screens ----------
+function sheetDialog(children, wide = true) {
+  const m = $("modal");
+  m.innerHTML = "";
+  const d = el("div", { className: "dialog sheet-screen" + (wide ? " wide" : ""), role: "dialog", "aria-modal": "true" }, children);
+  m.append(d);
+  m.classList.remove("hidden");
+  return d;
+}
+
+function showWelcome() {
+  const done = async () => { closeModal(); await chrome.storage.local.set({ showWelcome: false }); };
+  const point = (icon, title, text) => el("div", { className: "welcome-point" }, [
+    el("span", { className: "tile sm", html: svgIcon(icon, 16) }),
+    el("div", {}, [el("div", { className: "wp-title", textContent: title }), el("div", { className: "wp-text", textContent: text })])
+  ]);
+  sheetDialog([
+    el("div", { className: "screen-hero" }, [el("div", { className: "logo big", html: svgIcon("layers", 26) }),
+      el("div", {}, [el("h2", { textContent: "Welcome to Tab Workflows" }),
+        el("p", { textContent: "Keep your tabs in named workflows and switch between them in one click." })])]),
+    el("div", { className: "welcome-points" }, [
+      point("folder", "Workflows", "A workflow is a set of tabs – work, school, a project. Your open tabs are your first one."),
+      point("save", "Autosave", "Every change to your tabs is saved into the workflow you’re in. “Save current” in the popup saves right away."),
+      point("switch", "Switching", "Open another workflow from the popup or here. Your tabs are saved, closed and the other workflow’s tabs open."),
+      point("divider", "Dividers", "Split your tab strip with named, coloured divider tabs (Alt+Shift+D). They sleep, so they cost almost no memory."),
+      point("cloud", "Sync & backups", "Sync between Chrome, Helium, Brave… in Settings → Sync. Daily backups and 3 copies per workflow keep you safe."),
+      point("command", "Shortcuts", "Ctrl+Shift+K opens the popup, Ctrl+K here opens the command palette, Ctrl+Z undoes.")
+    ]),
+    el("div", { className: "buttons" }, [el("button", { className: "btn primary", textContent: "Get started", on: { click: done } })])
+  ]);
+  $("modal").onmousedown = null;
+  $("modal")._cancel = done;
+}
+
+// Render the changelog sections newer than `mine` (as text – never as HTML).
+function changelogNodes(text, mine) {
+  const out = [];
+  let on = false, list = null;
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    const v = line.match(/^##\s+v?(\d+(?:\.\d+)*)/);
+    if (v) {
+      on = cmpVer(v[1], mine) > 0;
+      list = null;
+      if (on) out.push(el("h3", { className: "cl-version", textContent: "Version " + v[1] }));
+      continue;
+    }
+    if (!on || !line || /^#\s/.test(line)) continue;
+    const h = line.match(/^###\s+(.*)/);
+    if (h) { out.push(el("div", { className: "cl-kind", textContent: h[1] })); list = null; continue; }
+    const b = line.match(/^[*-]\s+(.*)/);
+    if (b) {
+      if (!list) { list = el("ul", { className: "cl-list" }); out.push(list); }
+      list.append(el("li", { textContent: b[1] }));
+    }
+  }
+  return out;
+}
+// A changelog without any "## <version>" sections (e.g. a placeholder): show every line as it is (as text).
+function plainChangelogNodes(text) {
+  const out = [];
+  let list = null;
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const b = line.match(/^[*-]\s+(.*)/);
+    const body = (b ? b[1] : line).replace(/^#+\s*/, "");
+    if (!body) continue;
+    if (b) {
+      if (!list) { list = el("ul", { className: "cl-list" }); out.push(list); }
+      list.append(el("li", { textContent: body }));
+    } else {
+      list = null;
+      out.push(el(/^#/.test(line) ? "h3" : "p", { className: /^#/.test(line) ? "cl-version" : "", textContent: body }));
+    }
+  }
+  return out;
+}
+const hasVersionSections = text => /^\s*##\s+v?\d/m.test(String(text || ""));
+function cmpVer(a, b) {
+  const pa = String(a).split(".").map(Number), pb = String(b).split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d > 0 ? 1 : -1; }
+  return 0;
+}
+
+// The outdated screen shows CHANGELOG.md from GitHub (always the newest). If GitHub can't be reached,
+// or that file has nothing newer than this browser's version, it uses the copy the newer browser shared through sync.
+const CHANGELOG_URL = "https://raw.githubusercontent.com/reapertakumi/Tab-Workflows/main/CHANGELOG.md";
+const CHANGELOG_PAGE = "https://github.com/reapertakumi/Tab-Workflows/blob/main/CHANGELOG.md";
+
+async function githubChangelog() {
+  try {
+    const r = await fetch(CHANGELOG_URL, { cache: "no-store" });
+    return r.ok ? await r.text() : null;
+  } catch (_) { return null; }
+}
+
+async function showUpdateScreen(n) {
+  const github = await githubChangelog();
+  // GitHub's file wins whenever it has something to show: its newer versions, or – if it has no
+  // version sections at all – its whole text.
+  const fromGithub = !github ? [] : hasVersionSections(github) ? changelogNodes(github, n.mine) : plainChangelogNodes(github);
+  const later = async () => {
+    closeModal();
+    const { updateNotice } = await chrome.storage.local.get("updateNotice");
+    if (updateNotice) await chrome.storage.local.set({ updateNotice: { ...updateNotice, dismissed: true } });
+  };
+  const notes = fromGithub.length ? fromGithub : changelogNodes(n.notes, n.mine);
+  const source = fromGithub.length ? "From the changelog on GitHub."
+    : notes.length ? (github === null ? "GitHub couldn’t be reached – showing the changelog your other browser shared." : "Showing the changelog your other browser shared.") : "";
+  sheetDialog([
+    el("div", { className: "screen-hero" }, [el("div", { className: "logo big warn", html: svgIcon("upload", 24) }),
+      el("div", {}, [el("div", { className: "chip warn-chip", textContent: "OUTDATED" }),
+        el("h2", { textContent: "Update available" }),
+        el("p", { textContent: `This browser runs Tab Workflows ${n.mine}. ${n.browser} – synced with this one – already runs ${n.latest}. Update here too so both work the same way.` })])]),
+    el("div", { className: "version-compare" }, [
+      el("div", { className: "vc old" }, [el("span", { textContent: "This browser" }), el("b", { textContent: n.mine })]),
+      el("span", { className: "vc-arrow", html: svgIcon("arrow", 18) }),
+      el("div", { className: "vc new" }, [el("span", { textContent: n.browser }), el("b", { textContent: n.latest })])
+    ]),
+    el("div", { className: "changelog" }, notes.length ? notes : [el("p", { textContent: "No list of changes found – update to see what’s new." })]),
+    el("p", { className: "muted small" }, [source ? source + " " : "",
+      el("a", { href: CHANGELOG_PAGE, target: "_blank", rel: "noopener", textContent: "View the changelog on GitHub" })]),
+    el("p", { className: "muted small", textContent: "To update: replace the extension’s files with the new version (or update it from the store), then press the reload button on the extensions page." }),
+    el("div", { className: "buttons" }, [
+      el("button", { className: "btn ghost", textContent: "Later", on: { click: later } }),
+      el("button", { className: "btn primary", textContent: "Open extensions page", on: { click: () => chrome.tabs.create({ url: "chrome://extensions/?id=" + chrome.runtime.id }) } })
+    ])
+  ]);
+  $("modal").onmousedown = e => { if (e.target === $("modal")) later(); };
+  $("modal")._cancel = later;
+}
+
+let updateShownFor = null;
+async function maybeShowUpdate() {
+  const { updateNotice: n } = await chrome.storage.local.get("updateNotice");
+  if (!n || n.dismissed || updateShownFor === n.latest || !$("modal").classList.contains("hidden")) return;
+  updateShownFor = n.latest;
+  showUpdateScreen(n);
+}
+
+(async () => {
+  const { showWelcome: welcome } = await chrome.storage.local.get("showWelcome");
+  if (welcome) showWelcome();
+  else maybeShowUpdate();
+})();
+
+// ---------- Session Manager shortcuts (changeable in Settings → About) ----------
+const HOTKEY_ACTIONS = [["palette", "Command palette"], ["undo", "Undo"], ["search", "Search the board"]];
+let recordingHotkey = false;
+// (function declarations: the palette button uses them before this part of the file has run)
+function hotkeys() { return { ...DEFAULT_SETTINGS.hotkeys, ...(settings.hotkeys || {}) }; }
+function hotkeyLabel(c) { return String(c || "").split("+").join(" "); }
+
+// "Ctrl+Shift+K", "Alt+F2", "/" … (Ctrl and ⌘ count as the same; Shift is ignored for symbols like / and ?)
+function comboFromEvent(e) {
+  if (["Control", "Shift", "Alt", "Meta", "AltGraph", "CapsLock", "Dead", "Unidentified"].includes(e.key)) return "";
+  let key = e.key === " " ? "Space" : e.key;
+  if (key.length === 1) key = key.toUpperCase();
+  const symbol = key.length === 1 && key.toLowerCase() === key.toUpperCase() && !/[0-9]/.test(key);
+  const parts = [];
+  if (e.ctrlKey || e.metaKey) parts.push("Ctrl");
+  if (e.altKey) parts.push("Alt");
+  if (e.shiftKey && !(symbol && !e.ctrlKey && !e.metaKey && !e.altKey)) parts.push("Shift");
+  parts.push(key);
+  return parts.join("+");
+}
+
+function hotkeyCap(id) {
+  const cap = el("button", { type: "button", className: "keycap edit", title: "Click, then press the new shortcut (Esc cancels)", textContent: hotkeyLabel(hotkeys()[id]) });
+  cap.addEventListener("click", () => {
+    if (recordingHotkey) return;
+    recordingHotkey = true;
+    cap.classList.add("recording");
+    cap.textContent = "Press keys…";
+    const stop = () => { recordingHotkey = false; cap.classList.remove("recording"); window.removeEventListener("keydown", onKey, true); cap.removeEventListener("blur", cancel); };
+    const cancel = () => { stop(); cap.textContent = hotkeyLabel(hotkeys()[id]); };
+    const onKey = async e => {
+      e.preventDefault(); e.stopPropagation();
+      if (e.key === "Escape") return cancel();
+      const combo = comboFromEvent(e);
+      if (!combo) return;
+      if (/^(Shift\+)?[A-Z0-9]$/.test(combo)) { cap.textContent = "Add Ctrl or Alt"; return; }   // would block typing
+      stop();
+      const next = hotkeys();
+      const clash = Object.keys(next).find(k => k !== id && next[k] === combo);
+      if (clash) next[clash] = next[id];       // swap with the action that had it
+      next[id] = combo;
+      await setSetting("hotkeys", next);
+      toast(`Shortcut set to ${hotkeyLabel(combo)}` + (clash ? ` (swapped with ${HOTKEY_ACTIONS.find(a => a[0] === clash)[1]})` : ""));
+    };
+    window.addEventListener("keydown", onKey, true);
+    cap.addEventListener("blur", cancel);
+  });
+  return el("div", { className: "row-btns" }, [cap,
+    hotkeys()[id] !== DEFAULT_SETTINGS.hotkeys[id] ? el("button", { className: "btn sm ghost", textContent: "Reset",
+      on: { click: () => setSetting("hotkeys", { ...hotkeys(), [id]: DEFAULT_SETTINGS.hotkeys[id] }) } }) : null]);
+}
+
+// The shortcut the browser really uses for one of our commands ("" when none is set).
+async function browserShortcut(name) {
+  try { const c = (await chrome.commands.getAll()).find(x => x.name === name); return c && c.shortcut ? hotkeyLabel(c.shortcut) : ""; }
+  catch (_) { return ""; }
+}

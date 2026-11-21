@@ -2,12 +2,12 @@ const ICON_NAMES = Object.keys(ICON_PATHS);
 const $ = id => document.getElementById(id);
 
 const els = {
-  logo: $("logo"), status: $("status"), newBtn: $("newBtn"), saveBtn: $("saveBtn"),
+  logo: $("logo"), status: $("status"), newBtn: $("newBtn"), saveBtn: $("saveBtn"), dividerBtn: $("dividerBtn"),
   sheet: $("sheet"), list: $("list"), empty: $("empty"), count: $("count")
 };
 
 let state = { workflows: {}, activeWorkflowId: null, currentSession: null, openWindows: {} };
-let sheetMode = null;        // null | "save" | "edit" | "new1" | "new2"
+let sheetMode = null;        // null | "save" | "edit" | "new2" (new workflow)
 let sheetData = {};          // form state for the open sheet
 const expanded = new Set();
 
@@ -148,58 +148,23 @@ function renderSheet() {
     return;
   }
 
-  if (sheetMode === "new1") {
-    const goNext = (save) => openSheet("new2", { name: "", icon: "folder", save });
-    if (active) {
-      const saveBtn = el("button", { className: "btn primary sm", textContent: "Save & continue",
-        on: { click: () => goNext({ mode: "active" }) } });
-      s.append(
-        sheetHead(`Save “${active.name}” first?`,
-          `Your ${plural(openTabs, "open tab")} will be saved to “${active.name}” before they’re closed.`, "Step 1 of 2"),
-        el("div", { className: "sheet-buttons" }, [
-          el("button", { className: "btn ghost sm", textContent: "Don’t save", on: { click: () => goNext({ mode: "none" }) } }),
-          saveBtn
-        ])
-      );
-      setTimeout(() => saveBtn.focus(), 0);
-    } else {
-      const data = { name: "", icon: "folder" };
-      const next = () => {
-        const name = (data.name || "").trim();
-        if (!name) return f.input.focus();
-        goNext({ mode: "new", name, icon: data.icon });
-      };
-      const f = nameField(data, "Name for your current tabs", next);
-      s.append(
-        sheetHead("Save your current tabs first?",
-          `These ${plural(openTabs, "tab")} aren’t in a workflow yet. Give them a name to keep them.`, "Step 1 of 2"),
-        f.node,
-        el("div", { className: "sheet-buttons" }, [
-          el("button", { className: "btn ghost sm", textContent: "Don’t save", on: { click: () => goNext({ mode: "none" }) } }),
-          el("button", { className: "btn primary sm", textContent: "Save & continue", on: { click: next } })
-        ])
-      );
-    }
-    return;
-  }
-
   if (sheetMode === "new2") {
     const create = async () => {
       const name = (sheetData.name || "").trim();
       if (!name) return f.input.focus();
       busy(btn, "Creating…");
+      if (sheetData.saveOpenTabs) {
+        // Save the open tabs as this workflow; the tabs stay where they are.
+        await send("saveAsWorkflow", { name, icon: sheetData.icon });
+        closeSheet(); load();
+        return;
+      }
       sendAndClose("createWorkflow", { name, icon: sheetData.icon, save: sheetData.save });
     };
     const f = nameField(sheetData, "New workflow name", create);
     const btn = el("button", { className: "btn primary sm", html: svgIcon("plus", 14) + "Create workflow", on: { click: create } });
     s.append(
-      sheetHead("New workflow",
-        sheetData.windowsMode
-          ? "It opens in a new window with one empty tab. Your current workflow stays open."
-          : sheetData.skipped
-          ? `Your tabs are already saved to “${state.workflows[state.activeWorkflowId]?.name || "the open workflow"}”. They’ll be closed and you’ll start with one empty tab.`
-          : "All open tabs will be closed and you’ll start with one empty tab.",
-        sheetData.skipped || sheetData.windowsMode ? null : "Step 2 of 2"),
+      sheetHead("New workflow", sheetData.text),
       f.node,
       el("div", { className: "sheet-buttons" }, [btn])
     );
@@ -208,6 +173,22 @@ function renderSheet() {
 
 // ---------- inline confirmations (kept across re-renders) ----------
 let pendingConfirm = null;   // { id, kind: "open" | "delete" }
+
+// Manual save (autosave off): the save button turns into "Saved" for a moment. Kept here, not in the
+// button, because saving changes storage and the popup redraws right away.
+// It fades in and out (popup.css, 2 s); a redraw meanwhile continues the animation where it was.
+const SAVED_FLASH_MS = 2000;
+let savedFlash = null;       // { id, ok, text, at }
+let savedFlashTimer;
+async function saveManually(wf) {
+  const r = await send("saveIntoWorkflow", { id: wf.id });
+  const ok = !!(r.ok && r.result);
+  savedFlash = { id: wf.id, ok, at: Date.now(), text: ok ? `Saved ${plural(r.result.tabs, "tab")} to “${r.result.name}”` : "" };
+  render();
+  clearTimeout(savedFlashTimer);
+  savedFlashTimer = setTimeout(() => { savedFlash = null; savedFlashBack = wf.id; render(); savedFlashBack = null; }, SAVED_FLASH_MS);
+}
+let savedFlashBack = null;   // the save button fades back in after the confirmation
 let settings = { ...DEFAULT_SETTINGS };
 onSettings(s => { settings = s; });
 
@@ -271,7 +252,7 @@ function confirmBox(wf, kind) {
 
 // ---------- list ----------
 function renderTabs(wf) {
-  const ul = el("ul", { className: "tabs" });
+  const ul = el("ul", { className: "tabs", "data-wf": wf.id });
   let n = 0;
   const live = openWorkflowIds(state).has(wf.id) && wf.autosave !== false && settings.autosaveEnabled;
   (wf.windows || []).forEach((w, wi) => {
@@ -337,8 +318,13 @@ function renderItem(wf) {
     toggle,
     el("span", { className: "spacer" }),
     isOpenWin && !autosave
-      ? el("button", { className: "iconbtn", title: "Save open tabs into this workflow now", html: svgIcon("save", 15),
-          on: { click: () => send("saveIntoWorkflow", { id: wf.id }) } })
+      ? (savedFlash && savedFlash.id === wf.id
+        ? el("span", { className: "saved-flash" + (savedFlash.ok ? "" : " fail"), role: "status",
+            style: `animation-delay: -${Math.min(SAVED_FLASH_MS, Date.now() - savedFlash.at)}ms`,
+            title: savedFlash.ok ? savedFlash.text : "There were no open tabs to save",
+            html: svgIcon(savedFlash.ok ? "check" : "close", 14) + (savedFlash.ok ? "Saved" : "Nothing to save") })
+        : el("button", { className: "iconbtn" + (savedFlashBack === wf.id ? " fade-in" : ""), title: "Save open tabs into this workflow now", html: svgIcon("save", 15),
+            on: { click: () => saveManually(wf) } }))
       : null,
     el("button", { className: "iconbtn open" + (isOpen ? " expanded" : ""), title: isOpen ? "Hide tabs" : "Show tabs",
       html: svgIcon("chevron", 16), on: { click: () => { isOpen ? expanded.delete(wf.id) : expanded.add(wf.id); render(); } } }),
@@ -369,17 +355,40 @@ function renderItem(wf) {
 function render() {
   const { workflows, currentSession } = state;
   const n = currentSession ? countTabs(currentSession.windows) : 0;
+  const cur = workflows[state.activeWorkflowId];
+  // Green only when your tabs really are being autosaved: not when autosave is paused everywhere,
+  // or turned off for the workflow you're in (then it only changes when you press save).
   els.status.innerHTML = "";
-  els.status.append(
-    el("span", { className: "dot" }),
-    currentSession ? `Autosaved · ${plural(n, "tab")} · ${timeAgo(currentSession.savedAt)}` : "Not saved yet"
-  );
+  if (!settings.autosaveEnabled) {
+    els.status.append(el("span", { className: "dot off" }), "Autosave paused – turn it on in Settings");
+  } else if (cur && cur.autosave === false) {
+    els.status.append(el("span", { className: "dot off" }),
+      `Autosave off for “${cur.name}” · saved ${timeAgo(cur.savedAt)}`);
+  } else {
+    els.status.append(el("span", { className: "dot" }),
+      currentSession ? `Autosaved · ${plural(n, "tab")} · ${timeAgo(currentSession.savedAt)}` : "Not saved yet");
+  }
+  els.status.title = els.status.textContent;
 
+  els.saveBtn.title = cur ? `Save your open tabs into “${cur.name}” now` : "Save your open tabs as a new workflow";
   const list = Object.values(workflows).sort((a, b) => a.createdAt - b.createdAt);
   els.count.textContent = list.length || "";
+  // The list is rebuilt on every change (a tab loading, autosave…): keep every scroll position –
+  // the page, the list and each workflow's open tab list – instead of jumping back to the top.
+  const scrollers = [document.scrollingElement, els.list, ...ancestors(els.list)].filter(Boolean);
+  const outer = scrollers.map(n => n.scrollTop);
+  const inner = {};
+  for (const ul of els.list.querySelectorAll("ul.tabs[data-wf]")) if (ul.scrollTop) inner[ul.dataset.wf] = ul.scrollTop;
   els.list.innerHTML = "";
   els.empty.classList.toggle("hidden", list.length > 0);
   for (const wf of list) els.list.append(renderItem(wf));
+  for (const ul of els.list.querySelectorAll("ul.tabs[data-wf]")) if (inner[ul.dataset.wf]) ul.scrollTop = inner[ul.dataset.wf];
+  scrollers.forEach((n, i) => { if (outer[i]) n.scrollTop = outer[i]; });
+}
+function ancestors(n) {
+  const out = [];
+  for (let p = n.parentElement; p && p !== document.body; p = p.parentElement) out.push(p);
+  return out;
 }
 
 async function load() {
@@ -399,15 +408,38 @@ $("topRight").append(
 els.newBtn.innerHTML = svgIcon("plus", 16) + "New workflow";
 els.saveBtn.innerHTML = svgIcon("save", 15) + "Save current";
 els.empty.textContent = "No workflows yet. Save your current tabs or create a new workflow to get started.";
+// "New workflow" goes straight to naming it – nothing to answer first.
 els.newBtn.addEventListener("click", () => {
   const active = state.workflows[state.activeWorkflowId];
-  // New-window mode closes nothing, so there's nothing to save first.
-  if (settings.switchMode === "windows") openSheet("new2", { name: "", icon: "folder", save: { mode: "none" }, windowsMode: true });
-  // Open workflow already autosaves -> nothing to ask, go straight to naming the new one.
-  else if (active && active.autosave !== false) openSheet("new2", { name: "", icon: "folder", save: { mode: "active" }, skipped: true });
-  else openSheet("new1");
+  let save, text;
+  if (settings.switchMode === "windows") {
+    save = { mode: "none" };
+    text = "It opens in a new window with one empty tab. Your current workflow stays open.";
+  } else if (active && active.autosave !== false) {
+    save = { mode: "active" };
+    text = `Your tabs stay saved in “${active.name}”. They close and you start with one empty tab.`;
+  } else if (active) {
+    save = { mode: "none" };       // autosave off: that workflow stays as you last saved it
+    text = `“${active.name}” stays as you last saved it. Your tabs close and you start with one empty tab.`;
+  } else {
+    // No workflow open: the tabs you have open simply become the new workflow (nothing closes).
+    openSheet("new2", { name: "", icon: "folder", saveOpenTabs: true, text: "Your open tabs will be saved in this new Workflow" });
+    return;
+  }
+  openSheet("new2", { name: "", icon: "folder", save, text });
 });
-els.saveBtn.addEventListener("click", () => openSheet("save", { name: "", icon: "folder" }));
+// "Save current": save the open tabs into the workflow you're in. Not in a workflow: save them as a new one.
+els.saveBtn.addEventListener("click", async () => {
+  const active = state.workflows[state.activeWorkflowId];
+  if (!active) return openSheet("save", { name: "", icon: "folder" });
+  const r = await send("saveCurrent");
+  if (!r.ok || !r.result) return openSheet("save", { name: "", icon: "folder" });
+  els.saveBtn.innerHTML = svgIcon("check", 15) + "Saved";
+  els.saveBtn.title = `Saved ${plural(r.result.tabs, "tab")} to “${r.result.name}”`;
+  setTimeout(() => { els.saveBtn.innerHTML = svgIcon("save", 15) + "Save current"; }, 1500);
+});
+els.dividerBtn.innerHTML = svgIcon("divider", 16);
+els.dividerBtn.addEventListener("click", async () => { await send("insertDividerTab"); window.close(); });
 
 chrome.storage.onChanged.addListener((changes, area) => { if (area === "local") load(); });
 load();

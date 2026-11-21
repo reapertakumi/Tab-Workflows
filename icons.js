@@ -45,6 +45,7 @@ const ICON_PATHS = {
 // UI glyphs (not offered in the picker)
 const UI_PATHS = {
   plus:    "M12 5v14 M5 12h14",
+  divider: "M3 12h18 M7 6h10 M7 18h10",
   save:    "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z M17 21v-8H7v8 M7 3v5h8",
   edit:    "M12 20h9 M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z",
   trash:   "M3 6h18 M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2 M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6 M10 11v6 M14 11v6",
