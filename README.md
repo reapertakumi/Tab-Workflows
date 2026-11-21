@@ -69,12 +69,12 @@ Light, dark or system theme · 6 accent colours · backgrounds (dots, grid, grap
 ## 📦 Installation
 
 ### Chrome Web Store (recommended)
-Install it from the [**Chrome Web Store**](CHROME_WEB_STORE_LINK). Updates install automatically. Works in Chrome, Edge, Brave and other Chromium browsers.
+Install it from the [**Chrome Web Store**](https://chromewebstore.google.com/detail/ipfjagejbpcgddgbcpllbiahgaljmclg?utm_source=item-share-cb). Updates install automatically. Works in Chrome, Edge, Brave and other Chromium browsers.
 
 ### Manual install (developer mode)
-1. Download the latest release ZIP from [Releases](GITHUB_REPO_URL/releases) and unzip it, or clone the repo:
+1. Download the latest release ZIP from [Releases](https://github.com/reapertakumi/Tab-Workflows/releases) and unzip it, or clone the repo:
    ```bash
-   git clone GITHUB_REPO_URL.git
+   git clone https://github.com/reapertakumi/Tab-Workflows.git
    ```
 2. Open `chrome://extensions/` (or `edge://extensions/`).
 3. Turn on **Developer mode** (top right).
@@ -120,7 +120,7 @@ Install it from the [**Chrome Web Store**](CHROME_WEB_STORE_LINK). Updates insta
 | `store-assets/` | Chrome Web Store screenshots and promo tiles (not part of the extension package) |
 
 ## 💬 Feedback & contributing
-Found a bug or have an idea? [Open an issue](GITHUB_REPO_URL/issues). Pull requests are welcome.
+Found a bug or have an idea? [Open an issue](https://github.com/reapertakumi/Tab-Workflows/issues). Pull requests are welcome.
 
 ---
 
