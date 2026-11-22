@@ -289,6 +289,8 @@ mark { background: var(--mark); color: inherit; border-radius: 3px; padding: 0 1
 .set-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin: 0; padding: 14px 18px 4px; font-weight: 650; }
 .set-row { display: flex; align-items: center; gap: 16px; padding: 12px 18px; border-top: 1px solid var(--border); }
 .set-section h2 + .set-row { border-top: none; }
+/* why the last WebDAV Connect failed (Sync page) */
+.set-row.webdav-problem { display: block; color: var(--danger); font-size: 12.5px; line-height: 1.5; border-top: none; padding-top: 0; overflow-wrap: anywhere; }
 .set-text { flex: 1; min-width: 0; }
 .set-label { font-weight: 580; }
 .set-desc { font-size: 12.5px; color: var(--muted); }

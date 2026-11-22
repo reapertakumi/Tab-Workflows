@@ -384,10 +384,11 @@ async function gunzipB64(b64) {
 async function syncNow() {
   const s = await getSettings();
   if (s.syncMethod !== "chrome" || !chrome.storage.sync) return null;
-  const { workflows = {}, looseTabs = [] } = await chrome.storage.local.get(["workflows", "looseTabs"]);
+  const { workflows = {}, looseTabs = [], tombstones = {} } = await chrome.storage.local.get(["workflows", "looseTabs", "tombstones"]);
   const device = await getDeviceId();
   const at = Date.now();
-  const b64 = await gzipB64(JSON.stringify({ v: 1, at, device, workflows, looseTabs }));
+  // Tombstones: so a workflow deleted here is also deleted in the other profiles when they merge.
+  const b64 = await gzipB64(JSON.stringify({ v: 1, at, device, workflows, looseTabs, tombstones }));
   if (b64.length > SYNC_LIMIT) {
     const status = { ok: false, at, size: b64.length,
       error: "Your workflows are too big for Chrome sync (about 90 KB after compression). Daily backup files still work." };
@@ -421,13 +422,20 @@ async function syncInfo() {
   return { at: meta.at, size: meta.size, count: meta.count, fromOtherDevice: meta.device !== device };
 }
 
+// The synced copy in the Chrome profile. Throws while Chrome hasn't received all of its pieces yet.
+async function readChromeSyncCopy(meta) {
+  const keys = Array.from({ length: meta.chunks }, (_, i) => "sync_" + i);
+  const got = await chrome.storage.sync.get(keys);
+  const b64 = keys.map(k => got[k] || "").join("");
+  if (meta.size && b64.length !== meta.size) throw new Error("The synced copy hasn't fully arrived yet");
+  return JSON.parse(await gunzipB64(b64));
+}
+
 // Bring workflows from the synced copy: "merge" adds/updates, "replace" swaps everything.
 async function syncPull({ mode = "merge" }) {
   const meta = (await chrome.storage.sync.get("sync_meta")).sync_meta;
   if (!meta) throw new Error("Nothing has been synced yet");
-  const keys = Array.from({ length: meta.chunks }, (_, i) => "sync_" + i);
-  const got = await chrome.storage.sync.get(keys);
-  const remote = JSON.parse(await gunzipB64(keys.map(k => got[k] || "").join("")));
+  const remote = await readChromeSyncCopy(meta);
   await pushHistory(mode === "replace" ? "Replace with synced workflows" : "Merge synced workflows");
 
   const { workflows: localAll } = await loadState();
@@ -457,9 +465,37 @@ chrome.storage.onChanged.addListener((ch, area) => {
   if (settings.syncMethod === "chrome") chrome.alarms.create("sync-push", { delayInMinutes: 1 });
 });
 
+// When another profile's copy arrives, merge it in by itself (the same merge as the other sync methods:
+// the newest version of each workflow wins, deletions are kept). If that changed anything here, the
+// "sync-push" above sends the combined result back a minute later; the other profile then has nothing
+// new to merge, so it stops there.
+async function mergeChromeSyncCopy() {
+  const s = await getSettings();
+  if (s.syncMethod !== "chrome" || !chrome.storage.sync) return false;
+  const meta = (await chrome.storage.sync.get("sync_meta")).sync_meta;
+  if (!meta || meta.device === await getDeviceId()) return false;      // nothing, or our own upload
+  const { chromeSyncMergedAt = 0 } = await chrome.storage.local.get("chromeSyncMergedAt");
+  if ((meta.at || 0) <= chromeSyncMergedAt) return false;                // merged that one already
+  let remote;
+  try { remote = await readChromeSyncCopy(meta); }
+  catch (_) { chrome.alarms.create("sync-merge", { delayInMinutes: 1 }); return false; }   // pieces still arriving
+  await mergeRemote(remote);
+  await chrome.storage.local.set({ chromeSyncMergedAt: meta.at || Date.now() });
+  return true;
+}
+chrome.storage.onChanged.addListener((ch, area) => {
+  if (area === "sync" && Object.keys(ch).some(k => k === "sync_meta" || k.startsWith("sync_"))) enqueue(mergeChromeSyncCopy);
+  if (area === "local" && ch.settings && (ch.settings.newValue || {}).syncMethod === "chrome"
+      && (ch.settings.oldValue || {}).syncMethod !== "chrome") enqueue(mergeChromeSyncCopy);   // just switched to it
+});
+// Anything that arrived while the browser was closed. setTimeout: this file is loaded before background.js
+// has set up enqueue's queue.
+setTimeout(() => enqueue(mergeChromeSyncCopy), 0);
+
 chrome.alarms.onAlarm.addListener(a => {
   if (a.name === "daily-backup") enqueue(autoBackup);
   if (a.name === "sync-push") enqueue(syncNow);
+  if (a.name === "sync-merge") enqueue(mergeChromeSyncCopy);
 });
 
 // ======================= Opening a workflow's tabs (Close & reopen) =======================
@@ -598,9 +634,6 @@ const httpError = async (who, r) => {
   const hint = r.status === 401 || r.status === 403 ? " – check the token / password." : r.status === 404 ? " – check the address." : "";
   return new Error(`${who} answered ${r.status} ${r.statusText || ""}${hint}`.trim());
 };
-const webdavFileUrl = cfg => /\.json$/i.test(cfg.webdavUrl || "") ? cfg.webdavUrl : String(cfg.webdavUrl || "").replace(/\/?$/, "/") + SYNC_FILE;
-const webdavAuth = cfg => ({ Authorization: "Basic " + b64utf8(`${cfg.webdavUser || ""}:${cfg.webdavPass || ""}`) });
-
 const SYNC_PROVIDERS = {
   gist: {
     async get(cfg) {
@@ -656,17 +689,14 @@ const SYNC_PROVIDERS = {
       if (!r.ok) throw await httpError("Your server", r);
     }
   },
+  // WebDAV: through webdav.js – the same client the Sync page's Connect uses.
   webdav: {
     async get(cfg) {
       if (!cfg.webdavUrl) throw new Error("Add your WebDAV folder address first.");
-      const r = await fetch(webdavFileUrl(cfg), { headers: webdavAuth(cfg), cache: "no-store" });
-      if (r.status === 404) return null;
-      if (!r.ok) throw await httpError("WebDAV", r);
-      return r.text();
+      return WebDAV.read({ url: cfg.webdavUrl, user: cfg.webdavUser, pass: cfg.webdavPass });
     },
     async put(cfg, text) {
-      const r = await fetch(webdavFileUrl(cfg), { method: "PUT", headers: { ...webdavAuth(cfg), "Content-Type": "application/json" }, body: text });
-      if (!r.ok) throw await httpError("WebDAV", r);
+      await WebDAV.write({ url: cfg.webdavUrl, user: cfg.webdavUser, pass: cfg.webdavPass }, text);
     }
   }
 };

@@ -15,7 +15,7 @@
 // "new window" mode several workflows can be open (and autosaving) at the same time.
 // An open workflow is "live" when its autosave is on: manager edits then change the real tabs too.
 
-importScripts("settings.js", "sync-core.js", "bg-extras.js", "context-menu.js");
+importScripts("settings.js", "sync-core.js", "webdav.js", "bg-extras.js", "context-menu.js");
 
 const EXT_PREFIX = chrome.runtime.getURL("");
 const MANAGER_URL = chrome.runtime.getURL("manager.html");

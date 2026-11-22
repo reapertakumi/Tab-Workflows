@@ -1061,10 +1061,16 @@ const SYNC_METHODS = [
 ];
 const MULTI_SYNC = ["folder", "gist", "server", "webdav"];
 
+// true when access was given; `askHostAccess.prompted` says whether Chrome had to ask (false: allowed already).
 async function askHostAccess(urls) {
-  const origins = [...new Set(urls.map(u => { try { return new URL(u).origin + "/*"; } catch (_) { return null; } }).filter(Boolean))];
+  const origins = WebDAV.accessPatterns(urls);   // (webdav.js – works for any address)
+  askHostAccess.prompted = false;
   if (!origins.length) return false;
-  try { return await chrome.permissions.request({ origins }); } catch (_) { return false; }
+  // Both start right away, while the click still counts (an await before request() could lose Chrome's prompt).
+  const had = chrome.permissions.contains({ origins }).catch(() => false);
+  const asked = chrome.permissions.request({ origins }).catch(() => false);
+  askHostAccess.prompted = !(await had);
+  return asked;
 }
 
 // `passphrase`: only right after you typed it – lets this sync read a file an older version wrote.
@@ -1092,29 +1098,54 @@ function connectionRow(st, idleText, method) {
   const detail = state === "on" ? `Last synced ${timeAgo(st.at)}.`
     : state === "off" ? `${st.error || "The last sync failed."} · ${timeAgo(st.at)}` : idleText;
   const pill = el("span", { className: "conn-pill " + state, role: "status" }, [el("span", { className: "conn-dot" }), label]);
-  return row("Connection", detail, method && st
-    ? el("div", { className: "row-btns" }, [pill, el("button", { className: "btn sm", textContent: "Disconnect", on: { click: () => disconnectSync(method) } })])
-    : pill);
+  // Red (the last sync failed): Reconnect tries again right away. Green: Disconnect.
+  const action = !(method && st) ? null : state === "off"
+    ? el("button", { className: "btn sm primary", textContent: "Reconnect", on: { click: e => reconnectSync(method, e.currentTarget) } })
+    : el("button", { className: "btn sm", textContent: "Disconnect", on: { click: () => disconnectSync(method) } });
+  return row("Connection", detail, action ? el("div", { className: "row-btns" }, [pill, action]) : pill);
+}
+
+async function reconnectSync(method, btn) {
+  btn.disabled = true; btn.textContent = "Reconnecting…";
+  try {
+    if (method === "chrome") {
+      const r = await send("syncNow");
+      toast(r.ok && r.result && r.result.ok ? "Reconnected – synced to your Chrome profile" : "Still can’t sync – " + ((r.result && r.result.error) || r.error || "try again later"));
+    } else {
+      const st = await syncOrOfferOverwrite();
+      if (st && st.ok) toast("Reconnected");
+    }
+  } finally { btn.disabled = false; btn.textContent = "Reconnect"; renderSettings(); }
 }
 
 // Stop syncing this browser and forget how it connected (login, token, address). Your workflows and the
 // passphrase stay; the synced copy elsewhere isn't touched.
 const SYNC_LOGIN_FIELDS = {
-  webdav: { webdavUrl: null, webdavUser: null, webdavPass: null, webdavReady: null },
+  webdav: { webdavUrl: null, webdavUser: null, webdavPass: null, webdavConnected: null, webdavReady: null },
   gist: { gistToken: null, gistVerified: null },
   server: { serverUrl: null },
   folder: {},
   chrome: {}
 };
+// Forget the saved passphrase (its salt and server id; the key made from it is useless without the salt).
+async function forgetPassphrase() {
+  const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
+  const next = { ...syncConfig };
+  for (const k of ["passphrase", "hasPassphrase", "keySalt", "syncId", "passMethod"]) delete next[k];
+  passDraft = "";
+  await chrome.storage.local.set({ syncConfig: next });
+}
+
 async function disconnectSync(method) {
   const name = (SYNC_METHODS.find(m => m[0] === method) || [, "sync"])[1];
   const forget = method === "folder" ? "the chosen folder" : method === "chrome" ? null : "the login saved for it";
   if (!(await confirmDialog(`Disconnect ${name}?`,
     `This browser stops syncing${forget ? ` and forgets ${forget}` : ""}. Your workflows stay here, and the synced copy isn’t deleted – you can connect again any time.`, "Disconnect", true))) return;
   await saveSyncFields(SYNC_LOGIN_FIELDS[method] || {});
+  if (method !== "chrome") await forgetPassphrase();   // connecting again means creating a passphrase again
   if (method === "folder") await idbSet("syncFolder", null).catch(() => {});
   for (const k of Object.keys(secretSavedAt)) delete secretSavedAt[k];
-  webdavDraft = null;
+  webdavDraft = null; webdavProblem = "";
   await chrome.storage.local.remove(["multiSyncStatus", method === "chrome" ? "syncStatus" : null].filter(Boolean));
   await setSetting("syncMethod", "off");
   toast(`Disconnected from ${name}`);
@@ -1125,20 +1156,20 @@ async function methodLinked(method, cfg) {
   if (method === "folder") return !!(await idbGet("syncFolder").catch(() => null));
   if (method === "gist") return !!(cfg.gistToken && (cfg.gistVerified || cfg.gistId));   // a token Connect checked (or that already synced)
   if (method === "server") return !!cfg.serverUrl;
-  if (method === "webdav") return !!(cfg.webdavUrl && cfg.webdavPass);
+  if (method === "webdav") return webdavLinked(cfg);
   return false;
 }
+const CHANGE_PASS_TEXT = "The synced copy is updated with the old passphrase first, then encrypted again with the new one. Your other browsers then need the new passphrase.";
 const hasSyncPassphrase = async () => {
   const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
   return !!(syncConfig.hasPassphrase || syncConfig.passphrase);
 };
-let focusPassNext = false;   // just connected: put the cursor in the passphrase that appears
 
 // After connecting: sync if there's a passphrase already, else show the passphrase step.
 async function afterConnect(what) {
-  if (await hasSyncPassphrase()) return syncToast(await runSync());
+  if (await hasSyncPassphrase()) return syncOrOfferOverwrite();
   toast(`${what} – now choose your passphrase`);
-  focusPassNext = true;
+  focusSoon("passphrase");
   renderSettings();
 }
 
@@ -1157,6 +1188,19 @@ function syncToast(st) {
   toast(st.ok ? (st.fromOther ? "Synced – workflows from your other browsers are here" : "Synced") : "Sync problem: " + st.error);
 }
 
+// Sync, and if the synced copy there was made with another passphrase (e.g. left from an earlier setup),
+// ask right away whether to replace it instead of just failing.
+const unreadableCopy = err => /wrong passphrase|another passphrase|different (one|passphrase)/i.test(String(err || ""));
+async function syncOrOfferOverwrite(force = false, passphrase = "") {
+  let st = await runSync(force, passphrase);
+  if (st && !st.ok && unreadableCopy(st.error) &&
+      await confirmDialog("There’s already a synced copy",
+        "It was made with a different passphrase, so it can’t be read with this one. Replace it with this browser’s workflows, encrypted with the passphrase saved here? Your other browsers then need this passphrase. Cancel if you’d rather type the passphrase you used before.",
+        "Replace it", true)) st = await runSync(true);
+  syncToast(st);
+  return st;
+}
+
 async function syncPage(section) {
   const { syncConfig = {}, multiSyncStatus = null, syncStatus = null } =
     await chrome.storage.local.get(["syncConfig", "multiSyncStatus", "syncStatus"]);
@@ -1170,10 +1214,12 @@ async function syncPage(section) {
     el("button", { className: "method" + (id === method ? " on" : ""), "aria-pressed": String(id === method),
       on: { click: async () => {
         if (id === method) return;
+        // Every connection gets its own passphrase: one saved for another method isn't carried over.
+        if (MULTI_SYNC.includes(id) && syncConfig.passMethod !== id) await forgetPassphrase();
         await setSetting("syncMethod", id);
         if (id === "chrome") { const r = await send("syncNow"); toast(r.ok && r.result && r.result.ok ? "Synced to your Chrome profile" : "Chrome profile sync turned on"); }
-        else if (MULTI_SYNC.includes(id) && (syncConfig.hasPassphrase || syncConfig.passphrase) && id !== "folder"
-                 && !(id === "webdav" && !webdavReady(syncConfig))
+        else if (MULTI_SYNC.includes(id) && syncConfig.passMethod === id && (syncConfig.hasPassphrase || syncConfig.passphrase) && id !== "folder"
+                 && !(id === "webdav" && !syncConfig.webdavConnected && !syncConfig.webdavReady)
                  && !(id === "gist" && !syncConfig.gistTokenEnc) && !(id === "server" && !syncConfig.serverUrlEnc)) syncToast(await runSync());
       } } }, [
       el("span", { className: "tile sm", html: svgIcon(icon, 16) }),
@@ -1183,48 +1229,22 @@ async function syncPage(section) {
 
   if (method === "chrome") out.push(await chromeSyncSection(section, syncStatus));
 
-  // WebDAV that isn't set up yet: one step at a time (folder → login → passphrase). Afterwards everything shows.
-  if (method === "webdav" && !webdavReady(syncConfig)) {
-    out.push(await webdavSetupSection(section, syncConfig));
-    return out;
-  }
-
   if (multi) {
-    // Passphrase
+    // Set up one step at a time (see "Setting up a connection" below); the rest shows once it's done.
     const hasPass = !!(syncConfig.hasPassphrase || syncConfig.passphrase);
-    const { pass, eye, markSaved } = passphraseField();
-    const savePass = el("button", { className: "btn sm primary", textContent: "Save", on: { click: async () => {
-      const v = pass.value;
-      if (v.length < 8) { toast("Use at least 8 characters"); pass.focus(); return; }
-      const same = syncConfig.syncId && syncConfig.syncId === await syncIdFor(v);
-      if (hasPass && !same &&
-          !(await confirmDialog("Change the passphrase?", "Every browser has to use the new passphrase. The synced copy was encrypted with the old one – you can overwrite it from this browser afterwards.", "Change"))) return;
-      const { syncConfig: cur = {} } = await chrome.storage.local.get("syncConfig");
-      const next = { ...cur, ...(await rememberPassphrase(v)) };
-      delete next.passphrase;
-      markSaved();                                   // before storing: the page redraws right after
-      await chrome.storage.local.set({ syncConfig: next });
-      toast("Passphrase saved – only a hash of it is kept");
-      syncToast(await runSync(false, v));
-    } } });
-    const passRow = row("Passphrase", "Your workflows are encrypted with it before they leave this browser, so the storage can’t read them. Use the same one in Chrome, Brave, Helium… It isn’t stored: only hashes of it and the encryption key made from it (which can’t be exported). If you lose it, pick a new one and overwrite the synced copy.",
-      el("div", { className: "field-row" }, [pass, eye, savePass]));
-    if (focusPassNext) { focusPassNext = false; requestAnimationFrame(() => pass.focus()); }
-
-    // Every method is set up in the same order: connection, then the folder / token / address,
-    // and only once that's connected the passphrase below it. The rest shows when both are done.
     const cfg = await unlockSyncConfig(await protectSyncConfig(syncConfig));   // decrypted only to fill the fields
-    const linked = await methodLinked(method, cfg);
-    const setup = !(linked && hasPass);
+    const steps = method === "webdav" ? webdavSteps(cfg)
+      : method === "folder" ? await folderSteps()
+      : { rows: await methodRows(method, cfg), linked: await methodLinked(method, cfg),
+          hint: "Step 1 of 2 · " + (method === "gist" ? "Connect your GitHub account." : "Connect your server.") };
+    const setup = !(steps.linked && hasPass);
     const cst = multiSyncStatus && multiSyncStatus.method === method ? multiSyncStatus : null;
+    const hint = !setup ? null : steps.linked && method !== "webdav" ? "Step 2 of 2 · Choose your sync passphrase and press Save." : steps.hint;
     out.push(section(SYNC_METHODS.find(m => m[0] === method)[1], [
-      setup ? connectionRow(null, linked ? "Not connected yet – choose your passphrase below." : "Not connected yet – " +
-        (method === "folder" ? "choose a folder below." : method === "gist" ? "paste your GitHub token below and press Connect." : "enter your server’s address below and press Connect."))
-            : connectionRow(cst, "Save a passphrase and press Connect.", method),
-      setup ? el("div", { className: "set-row muted", textContent: linked ? "Step 2 of 2 · Choose your sync passphrase."
-        : "Step 1 of 2 · " + (method === "folder" ? "Pick the folder to sync through." : method === "gist" ? "Connect your GitHub account." : "Connect your server.") }) : null,
-      ...(await methodRows(method, cfg)),
-      linked ? passRow : null].filter(Boolean)));
+      setup ? connectionRow(null, "Not connected yet – finish the steps below.") : connectionRow(cst, "Save a passphrase and press Connect.", method),
+      hint ? el("div", { className: "set-row muted", textContent: hint }) : null,
+      ...steps.rows,
+      steps.linked ? passphraseRow(syncConfig, hasPass, steps.linked) : null].filter(Boolean)));
     if (setup) return out;
 
     out.push(section("Settings", [
@@ -1282,42 +1302,205 @@ async function syncPage(section) {
   return out;
 }
 
-// ---------- the passphrase field ----------
-// Empty: "Enter / Create passphrase". After a save: "Saved (encrypted)" for 5 s with the eye hidden,
-// then "Type for new passphrase"; the eye comes back as soon as you type. Kept outside the field
-// because saving redraws the Sync page.
-const PASS_SAVED_MS = 5000;
-let passSavedAt = 0;          // when a passphrase was last saved on this page
-function passphraseField() {
-  const pass = el("input", { type: "password", className: "field", value: "", autocomplete: "new-password" });
-  const eye = el("button", { className: "iconbtn flat", title: "Show / hide", html: svgIcon("eye", 15),
-    on: { click: () => { pass.type = pass.type === "password" ? "text" : "password"; } } });
-  const show = () => {
-    const left = passSavedAt ? PASS_SAVED_MS - (Date.now() - passSavedAt) : 0;
-    const typing = pass.value.length > 0;
-    pass.placeholder = left > 0 ? "Saved (encrypted)" : passSavedAt ? "Type for new passphrase" : "Enter / Create passphrase";
-    eye.classList.toggle("hidden", !!passSavedAt && !typing);
-    clearTimeout(timer);                           // per field (see secretField)
-    if (left > 0) timer = setTimeout(show, left + 30);
+// ---------- Setting up a connection, one step at a time ----------
+// WebDAV:        folder address → Next (asks for access to it) · username & app password → Connect · passphrase → Save
+// Shared folder: Choose folder (Chrome asks for access right then) · passphrase → Save
+// Each step appears once the one before it is done and stays on the page afterwards, filled in, so it can be changed.
+// What you type is kept while the page redraws; the address, username and app password are stored once you press
+// Next / Connect, and shown again in their fields.
+let focusNext = null;   // { key, until }: the field to put the cursor in once it's on the page
+// Waits up to 5 s for the field to appear; once it's on the page, redraws in the next 800 ms keep the cursor in it.
+function focusSoon(key) { focusNext = { key, until: Date.now() + 5000, settled: false }; }
+// Every redraw in the next moment builds this field again: each new copy takes the cursor, so the one that
+// stays on the page has it (what you typed meanwhile is kept, see the drafts).
+function wantFocus(key, node) {
+  if (!focusNext || focusNext.key !== key || Date.now() > focusNext.until) return;
+  const tick = () => {
+    if (!focusNext || focusNext.key !== key || Date.now() > focusNext.until) return;
+    if (node.isConnected) {
+      if (!focusNext.settled) { focusNext.settled = true; focusNext.until = Date.now() + 800; }
+      if (document.activeElement !== node) node.focus();
+    } else requestAnimationFrame(tick);
   };
-  let timer;
-  pass.addEventListener("input", show);
-  show();
-  const markSaved = () => { passSavedAt = Date.now(); pass.value = ""; pass.type = "password"; pass.blur(); show(); };
-  return { pass, eye, markSaved };
+  tick();
+}
+const fieldRow = nodes => el("div", { className: "field-row" }, nodes.filter(Boolean));
+const onEnterKey = (input, fn) => input.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); fn(); } });
+function eyeButton(input) {
+  return el("button", { type: "button", className: "iconbtn flat", title: "Show / hide", html: svgIcon("eye", 15),
+    on: { click: () => { input.type = input.type === "password" ? "text" : "password"; } } });
+}
+function plainInput(value, placeholder, onInput, type = "text") {
+  const f = el("input", { type, className: "field", value: value || "", placeholder, spellcheck: false,
+    autocomplete: type === "password" ? "new-password" : "off" });
+  f.addEventListener("input", () => onInput(f.value));
+  return f;
 }
 
-// ---------- token / app password / username fields ----------
-// Saved (encrypted) as soon as you leave the field. A secret then shows "Saved (encrypted)" for 5 s and
-// afterwards dots, so it looks filled in; a username shows its first 3 letters and up to 5 stars (ale*****).
+// ---------- passphrase (last step of every method) ----------
+// The passphrase itself is never stored: it's turned into the encryption key (see sync-core.js).
+let passDraft = "";
+function passphraseRow(syncConfig, hasPass, linked) {
+  const pass = plainInput(passDraft, hasPass ? "Type to change" : "Create a passphrase (8 or more characters)",
+    v => { passDraft = v; }, "password");
+  const save = el("button", { className: "btn sm primary", textContent: "Save" });
+  save.addEventListener("click", async () => {
+    const v = pass.value;
+    if (v.length < 8) { toast("Use at least 8 characters"); pass.focus(); return; }
+    const changing = hasPass && syncConfig.syncId !== await syncIdFor(v);
+    if (changing && !(await confirmDialog("Change the passphrase?", CHANGE_PASS_TEXT, "Change"))) return;
+    save.disabled = true;
+    try {
+      // Changing it: first take in the newest synced changes with the old passphrase…
+      if (changing && linked) await runSync().catch(() => null);
+      const { syncConfig: cur = {} } = await chrome.storage.local.get("syncConfig");
+      const next = { ...cur, ...(await rememberPassphrase(v)), passMethod: settings.syncMethod };   // belongs to this connection
+      delete next.passphrase;
+      passDraft = "";
+      await chrome.storage.local.set({ syncConfig: next });
+      toast("Passphrase saved");
+      renderSettings();
+      // …then write the synced copy again, encrypted with the new one (else it stays unreadable here too).
+      await syncOrOfferOverwrite(changing, v);
+    } finally { save.disabled = false; }
+  });
+  onEnterKey(pass, () => save.click());
+  wantFocus("passphrase", pass);
+  return row("Passphrase", (hasPass ? "" : "Needed to connect: nothing syncs until you create one. ") +
+    "Your workflows are encrypted with it before they leave this browser, so the storage can’t read them. Use the same one in every browser. It isn’t stored – only the encryption key made from it, which can’t be exported.",
+    fieldRow([pass, eyeButton(pass), save]));
+}
+
+// ---------- WebDAV ----------
+// Three steps, all done through the WebDAV client in webdav.js (the same code the background syncs with):
+//   1 Folder address → Next: asks the browser for access to it (port included). The address is kept as typed.
+//   2 Username & app password → Connect: checks them by saving a small test file there (a missing folder is created).
+//   3 Passphrase → Save.
+// The address and username stay in their fields (also after the page redraws or you come back); they're stored
+// encrypted. The app password is different: once saved it never comes back into the page – the field says it's
+// saved, the eye only shows what you're typing right now, and Connect uses the saved one when the field is empty.
+let webdavDraft = null;     // { url, user, pass } as typed (pass: only what you typed and haven't connected with yet)
+let webdavProblem = "";     // why the last Connect failed – shown under the login until the next try
+const webdavLinked = cfg => !!(cfg.webdavUrl && cfg.webdavUser && cfg.webdavPass && (cfg.webdavConnected || cfg.webdavReady));
+
+function webdavSteps(cfg) {
+  const d = webdavDraft || (webdavDraft = { url: cfg.webdavUrl || "", user: cfg.webdavUser || "", pass: "" });
+  const passSaved = !!cfg.webdavPass;
+  const urlDone = !!cfg.webdavUrl;
+  const linked = webdavLinked(cfg);
+  const rows = [];
+
+  // 1 · Folder address → Next
+  const url = plainInput(d.url, "http://192.168.1.10:8086/webdav/  or  https://cloud.example.com/remote.php/dav/files/you/", v => { d.url = v; });
+  const next = el("button", { className: "btn sm" + (urlDone ? "" : " primary"), textContent: "Next" });
+  next.addEventListener("click", async () => {
+    const v = url.value.trim();
+    if (!/^https?:\/\/[^/]/i.test(v)) { toast("Enter the full folder address, starting with http:// or https://"); url.focus(); return; }
+    // First thing after the click, so the browser still counts it as your click and shows its prompt.
+    if (!(await askHostAccess([v]))) { toast("Tab Workflows needs your OK to reach that address"); url.focus(); return; }
+    d.url = v;
+    const access = askHostAccess.prompted ? "Access allowed" : `Access to ${new URL(v).host} was already allowed`;
+    if (v !== cfg.webdavUrl) {
+      webdavProblem = "";
+      focusSoon("webdav-user");
+      await saveSyncFields({ webdavUrl: v, webdavConnected: null, webdavReady: null });   // a new address needs Connect again
+      toast(access + " – now enter your username and app password");
+    } else toast(access);
+    renderSettings();
+  });
+  onEnterKey(url, () => next.click());
+  wantFocus("webdav-url", url);
+  rows.push(row("Folder address", "The WebDAV address of a folder on your storage (OxiCloud: http://<server>:8086/webdav/ · Nextcloud: Settings → WebDAV). Next asks your OK to reach it. The file " + SYNC_FILE + " is kept in it.",
+    fieldRow([url, next])));
+
+  // 2 · Username & app password → Connect
+  if (urlDone) {
+    const user = plainInput(d.user, "Username", v => { d.user = v; });
+    const pass = plainInput(d.pass, passSaved ? "Saved" : "App password", v => { d.pass = v; showEye(); }, "password");
+    // The eye only appears while there's something you typed in the field – it can't show the saved password.
+    const eye = eyeButton(pass);
+    const showEye = () => { eye.classList.toggle("hidden", !pass.value); if (!pass.value) pass.type = "password"; };
+    showEye();
+    const connect = el("button", { className: "btn sm" + (linked ? "" : " primary"), textContent: "Connect" });
+    connect.addEventListener("click", async () => {
+      const u = user.value.trim(), typed = pass.value;
+      if (!u) { toast("Enter your username"); user.focus(); return; }
+      if (!typed && !passSaved) { toast("Enter your app password"); pass.focus(); return; }
+      if (!(await askHostAccess([cfg.webdavUrl]))) { toast("Tab Workflows needs your OK to reach your WebDAV storage"); return; }
+      // Field empty: use the saved password – read from storage just for this check, never put in the field.
+      const p = typed || await savedWebdavPass();
+      connect.disabled = true; connect.textContent = "Connecting…";
+      const res = await WebDAV.check({ url: cfg.webdavUrl, user: u, pass: p });
+      connect.disabled = false; connect.textContent = "Connect";
+      d.user = u;
+      if (!res.ok) {
+        webdavProblem = res.message;
+        // Keep the address and username; a password that didn't work isn't stored (what you typed stays in the field).
+        await saveSyncFields({ webdavUser: u, webdavConnected: null });
+        toast("Couldn’t connect – see the message under the login");
+        renderSettings();
+        return;
+      }
+      webdavProblem = "";
+      d.pass = "";                              // connected: the field empties and just says it's saved
+      const hasPass = await hasSyncPassphrase();
+      if (!hasPass) focusSoon("passphrase");
+      await saveSyncFields({ webdavUser: u, webdavPass: p, webdavConnected: true });
+      renderSettings();
+      const made = res.created ? " (the folder didn’t exist, so it was created)" : "";
+      if (hasPass) { if (made) toast("Connected" + made); await syncOrOfferOverwrite(); }
+      else toast("Connected – now choose your passphrase" + made);
+    });
+    onEnterKey(user, () => pass.focus());
+    onEnterKey(pass, () => connect.click());
+    wantFocus("webdav-user", user);
+    rows.push(row("Username & app password", "Use an app password if your storage offers one (OxiCloud only takes an app password). Connect checks them by saving a small test file there.",
+      fieldRow([user, pass, eye, connect])));
+    if (webdavProblem) rows.push(el("div", { className: "set-row webdav-problem", role: "alert", textContent: webdavProblem }));
+  }
+
+  const hint = !urlDone ? "Step 1 of 3 · Enter your WebDAV folder address and press Next."
+    : !linked ? "Step 2 of 3 · Enter your username and app password and press Connect."
+    : "Step 3 of 3 · Choose your sync passphrase and press Save.";
+  return { rows, linked, hint };
+}
+
+// The saved app password, decrypted only for the moment it's needed (Connect with an empty field).
+async function savedWebdavPass() {
+  const { syncConfig = {} } = await chrome.storage.local.get("syncConfig");
+  return (await unlockSyncConfig(syncConfig)).webdavPass || "";
+}
+
+// ---------- Shared folder ----------
+// A folder on this computer can only be reached through Chrome's folder picker – there's no address to type.
+// Choosing it is step 1: Chrome asks for access to it right then.
+async function folderSteps() {
+  const handle = await idbGet("syncFolder").catch(() => null);
+  const perm = handle ? await handle.queryPermission({ mode: "readwrite" }).catch(() => "denied") : null;
+  const allow = handle && perm !== "granted" ? el("button", { className: "btn sm primary", textContent: "Allow access", on: { click: async () => {
+    const p = await handle.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+    if (p !== "granted") { await fileEditingBlocked(); return; }
+    if (await hasSyncPassphrase()) await syncOrOfferOverwrite();
+    renderSettings();
+  } } }) : null;
+  const choose = el("button", { className: "btn sm" + (handle ? "" : " primary"), html: svgIcon("folder", 14) + (handle ? "Change folder" : "Choose folder"),
+    on: { click: chooseSyncFolder } });
+  const rows = [
+    row("Folder", handle ? `“${handle.name}” · ${perm === "granted" ? "access allowed" : "needs your OK again"}`
+      : "The same folder in each browser (for other computers: a Dropbox / OneDrive / Google Drive folder). Chrome asks for access as soon as you choose it.",
+      el("div", { className: "row-btns" }, [allow, choose].filter(Boolean))),
+    el("div", { className: "set-row muted", textContent: "Brave: folder access is off by default – turn on brave://flags/#file-system-access-api, then restart Brave. Brave and Helium: Settings → Privacy → Site settings → File editing must not be “Don’t allow sites to edit files”." })
+  ];
+  return { rows, linked: !!handle, hint: !handle ? "Step 1 of 2 · Choose the folder to sync through." : "Step 2 of 2 · Choose your sync passphrase and press Save." };
+}
+
+const PASS_SAVED_MS = 5000;   // how long a saved token shows "Saved (encrypted)"
+// ---------- GitHub token field ----------
+// Saved (encrypted) as soon as you leave the field. It then shows "Saved (encrypted)" for 5 s and
+// afterwards dots, so it looks filled in.
 // The times are kept outside the fields because saving redraws the Sync page.
 const SECRET_DOTS = "••••••••••••";
 const secretSavedAt = {};
-const maskName = name => {
-  const s = String(name || "");
-  const keep = s.length > 3 ? 3 : Math.min(1, s.length);
-  return s ? s.slice(0, keep) + "*".repeat(Math.min(5, Math.max(1, s.length - keep))) : "";
-};
 
 // `alsoOnChange`: fields to set together with a new value (e.g. a new token isn't checked yet).
 function secretField(key, isSaved, emptyPlaceholder, alsoOnChange = {}) {
@@ -1344,152 +1527,10 @@ function secretField(key, isSaved, emptyPlaceholder, alsoOnChange = {}) {
   return { input: f, get: () => f.value.trim() || pending, saved: () => saving };
 }
 
-function usernameField(key, saved) {
-  const f = el("input", { type: "text", className: "field", value: "", spellcheck: false, autocomplete: "off",
-    placeholder: saved ? maskName(saved) : "Username" });
-  let pending = "", saving = Promise.resolve();
-  f.addEventListener("blur", () => {
-    const v = f.value.trim();
-    if (!v) return;
-    pending = v;
-    f.value = "";
-    f.placeholder = maskName(v);
-    saving = saveSyncFields({ [key]: v });
-  });
-  return { input: f, get: () => f.value.trim() || pending, saved: () => saving };
-}
-
-// ---------- WebDAV setup, step by step ----------
-// Set up = finished the steps once (webdavReady), or an older setup that already has a login and a passphrase.
-const webdavReady = cfg => !!(cfg.webdavReady || ((cfg.webdavUrlEnc || cfg.webdavUrl) && (cfg.webdavPassEnc || cfg.webdavPass) && (cfg.hasPassphrase || cfg.passphrase)));
-let webdavDraft = null;   // { step, url, user } while setting up (in memory; the login is saved at Connect)
-
-// Check the folder and the login before saving them. Returns "" when it works, else what's wrong.
-async function testWebdav(url, user, pass) {
-  const folder = /\.json$/i.test(url) ? url.replace(/[^/]*$/, "") : url.replace(/\/?$/, "/");
-  const bytes = new TextEncoder().encode(`${user}:${pass}`);
-  const auth = "Basic " + btoa(String.fromCharCode(...bytes));
-  let r;
-  try { r = await fetch(folder, { method: "PROPFIND", headers: { Authorization: auth, Depth: "0" }, cache: "no-store", credentials: "omit" }); }
-  catch (_) { return "Couldn’t reach that address – check it and your internet connection."; }
-  if (r.status === 401 || r.status === 403) return "The username or app password isn’t right.";
-  if (r.status === 404) return "That folder doesn’t exist – create it in your storage first.";
-  if (r.ok || r.status === 207 || r.status === 405) return "";
-  return `Your storage answered with error ${r.status}.`;
-}
-
-async function webdavSetupSection(section, syncConfig) {
-  const cfg = await unlockSyncConfig(await protectSyncConfig(syncConfig));
-  const loginSaved = !!(cfg.webdavUrl && cfg.webdavPass);
-  if (!webdavDraft) webdavDraft = { step: loginSaved ? 3 : 1, url: cfg.webdavUrl || "", user: cfg.webdavUser || "", focus: true };
-  const d = webdavDraft;
-  const goto = step => { d.step = step; d.focus = true; renderSettings(); };
-  const field = (value, placeholder, type = "text") => el("input", { type, className: "field", value: value || "", placeholder, spellcheck: false, autocomplete: type === "password" ? "new-password" : "off" });
-  const onEnter = (input, fn) => input.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); fn(); } });
-  const busy = async (btn, fn) => { btn.disabled = true; try { await fn(); } finally { btn.disabled = false; } };
-  const done = text => el("span", { className: "conn-pill on" }, [el("span", { className: "conn-dot" }), text]);
-  const rows = [];
-
-  rows.push(el("div", { className: "set-row muted", textContent: `Step ${d.step} of 3 · ` +
-    ["Enter your WebDAV folder address.", "Log in to your storage.", "Choose your sync passphrase."][d.step - 1] }));
-
-  // 1 · Folder address
-  if (d.step === 1) {
-    const url = field(d.url, "https://cloud.example.com/remote.php/dav/files/you/TabWorkflows/");
-    const next = el("button", { className: "btn sm primary", textContent: "Next", on: { click: () => {
-      const v = url.value.trim();
-      if (!/^https?:\/\//i.test(v)) { toast("Enter the full folder address, starting with https://"); url.focus(); return; }
-      d.url = v;
-      goto(2);
-    } } });
-    onEnter(url, () => next.click());
-    rows.push(row("Folder address", "A WebDAV folder that already exists (Nextcloud: Settings → WebDAV shows it). The file " + SYNC_FILE + " is created in it.",
-      el("div", { className: "field-row" }, [url, next])));
-    if (d.focus) requestAnimationFrame(() => url.focus());
-  } else {
-    rows.push(row("Folder address", d.url, el("button", { className: "btn sm", textContent: "Change", on: { click: () => goto(1) } })));
-  }
-
-  // 2 · Username & app password → Connect (asks for permission, then checks the login)
-  if (d.step === 2) {
-    const userF = usernameField("webdavUser", cfg.webdavUser);
-    const passF = secretField("webdavPass", !!cfg.webdavPass, "App password");
-    const user = userF.input, pass = passF.input;
-    const connect = el("button", { className: "btn sm primary", textContent: "Connect" });
-    connect.addEventListener("click", () => busy(connect, async () => {
-      d.user = userF.get() || cfg.webdavUser || "";
-      const p = passF.get() || cfg.webdavPass || "";
-      if (!d.user) { toast("Enter your username"); user.focus(); return; }
-      if (!p) { toast("Enter your app password"); pass.focus(); return; }
-      if (!(await askHostAccess([d.url]))) { toast("Tab Workflows needs your OK to reach your WebDAV storage"); return; }
-      await Promise.all([userF.saved(), passF.saved()]);
-      connect.textContent = "Connecting…";
-      const problem = await testWebdav(d.url, d.user, p);
-      connect.textContent = "Connect";
-      if (problem) { toast(problem); return; }
-      await saveSyncFields({ webdavUrl: d.url, webdavUser: d.user, webdavPass: p, webdavReady: null });
-      toast("Connected to your WebDAV storage");
-      goto(3);
-    }));
-    onEnter(user, () => pass.focus());
-    onEnter(pass, () => connect.click());
-    rows.push(row("Username & app password", "Use an app password if your storage offers one. Connecting asks your OK to reach this address.",
-      el("div", { className: "field-row" }, [user, pass, connect])));
-    if (d.focus) requestAnimationFrame(() => (cfg.webdavUser ? pass : user).focus());
-  } else if (d.step > 2) {
-    rows.push(row("Login", maskName(d.user), el("div", { className: "row-btns" }, [done("Connected"),
-      el("button", { className: "btn sm", textContent: "Change", on: { click: () => goto(2) } })])));
-  }
-
-  // 3 · Passphrase → Save (finishes the setup and syncs)
-  if (d.step === 3) {
-    const hasPass = !!(syncConfig.hasPassphrase || syncConfig.passphrase);
-    const { pass, eye, markSaved } = passphraseField();
-    const save = el("button", { className: "btn sm primary", textContent: "Save" });
-    save.addEventListener("click", () => busy(save, async () => {
-      const v = pass.value;
-      if (v || !hasPass) {
-        if (v.length < 8) { toast("Use at least 8 characters"); pass.focus(); return; }
-        if (hasPass && syncConfig.syncId !== await syncIdFor(v) &&
-            !(await confirmDialog("Change the passphrase?", "Every browser has to use the new passphrase. The synced copy was encrypted with the old one – you can overwrite it from this browser afterwards.", "Change"))) return;
-        const { syncConfig: cur = {} } = await chrome.storage.local.get("syncConfig");
-        const next = { ...cur, ...(await rememberPassphrase(v)) };
-        delete next.passphrase;
-        markSaved();                                 // the full Sync page then shows "Saved (encrypted)"
-        await chrome.storage.local.set({ syncConfig: next });
-      }
-      await saveSyncFields({ webdavReady: true });
-      webdavDraft = null;
-      toast("WebDAV sync is set up");
-      syncToast(await runSync(false, v));
-    }));
-    onEnter(pass, () => save.click());
-    rows.push(row("Passphrase", "Your workflows are encrypted with it before they leave this browser, so your storage can’t read them. Use the same one in Chrome, Brave, Helium… It isn’t stored: only hashes of it and the encryption key made from it.",
-      el("div", { className: "field-row" }, [pass, eye, save])));
-    if (d.focus) requestAnimationFrame(() => pass.focus());
-  }
-
-  d.focus = false;   // focus the new step's field once, not on every redraw (saving a field redraws)
-  return section("WebDAV", [d.step < 3 ? connectionRow(null, "Not connected yet – finish the steps below.") : null, ...rows].filter(Boolean));
-}
-
+// GitHub Gist and your own server: one field and Connect (the passphrase follows below it).
 async function methodRows(method, cfg) {
   const input = (value, placeholder, type = "text") => el("input", { type, className: "field", value: value || "", placeholder, spellcheck: false, autocomplete: "off" });
   const save = patch => saveSyncFields(patch);   // addresses, logins and ids are stored encrypted
-
-  if (method === "folder") {
-    const handle = await idbGet("syncFolder").catch(() => null);
-    const perm = handle ? await handle.queryPermission({ mode: "readwrite" }).catch(() => "denied") : null;
-    return [
-      row("Folder", handle ? `“${handle.name}”${perm === "granted" ? "" : " – needs your OK again"}`
-                           : "Pick the same folder in each browser (for other computers: a Dropbox / OneDrive / Google Drive folder).",
-        el("div", { className: "row-btns" }, [
-          handle && perm !== "granted" ? el("button", { className: "btn sm primary", textContent: "Allow access", on: { click: async () => syncToast(await folderSyncNow({ ask: true })) } }) : null,
-          el("button", { className: "btn sm" + (handle ? "" : " primary"), html: svgIcon("folder", 14) + (handle ? "Change folder" : "Choose folder"), on: { click: chooseSyncFolder } })
-        ])),
-      el("div", { className: "set-row muted", textContent: "Brave: folder access is off by default – turn on brave://flags/#file-system-access-api, then restart Brave." })
-    ];
-  }
 
   if (method === "gist") {
     const tok = secretField("gistToken", !!cfg.gistToken, "ghp_… or github_pat_…", { gistVerified: null });
@@ -1548,27 +1589,7 @@ async function methodRows(method, cfg) {
       help
     ];
   }
-
-  // webdav
-  const url = input(cfg.webdavUrl, "https://cloud.example.com/remote.php/dav/files/you/TabWorkflows/");
-  const userF = usernameField("webdavUser", cfg.webdavUser);
-  const passF = secretField("webdavPass", !!cfg.webdavPass, "App password");
-  const user = userF.input, pass = passF.input;
-  return [
-    row("Folder address", "A WebDAV folder that already exists (Nextcloud: Settings → WebDAV shows it). The file " + SYNC_FILE + " is created in it.", url),
-    row("Username & app password", "Use an app password if your storage offers one.", el("div", { className: "field-row" }, [user, pass,
-      el("button", { className: "btn sm primary", textContent: "Connect", on: { click: async () => {
-        const v = url.value.trim();
-        if (!/^https?:\/\//i.test(v)) { toast("Enter the full folder address, starting with https://"); return; }
-        if (!(await askHostAccess([v]))) { toast("Tab Workflows needs access to your WebDAV storage to sync"); return; }
-        const u = userF.get() || cfg.webdavUser || "", p = passF.get() || cfg.webdavPass || "";
-        await Promise.all([userF.saved(), passF.saved()]);   // leaving a field (to click here) saves it
-        if (!p) { toast("Enter your app password"); return; }
-        secretSavedAt.webdavPass = 1;                 // connected: show the dots right away
-        await save({ webdavUrl: v, webdavUser: u, webdavPass: p });
-        syncToast(await runSync());
-      } } })]))
-  ];
+  return [];
 }
 
 async function chromeSyncSection(section, syncStatus) {
@@ -1623,11 +1644,37 @@ async function chooseSyncFolder() {
   }
   let handle;
   try { handle = await window.showDirectoryPicker({ id: "tab-workflows-sync", mode: "readwrite" }); }
-  catch (_) { return; }   // cancelled
+  catch (e) {
+    if (e && e.name === "AbortError") return;   // cancelled
+    // Refused before the picker even opens: the browser blocks sites from editing files
+    // (Brave and Helium can have "File editing" set to "Don't allow").
+    if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")) { await fileEditingBlocked(); return; }
+    toast("Couldn’t open the folder picker: " + ((e && e.message) || e));
+    return;
+  }
+  // Access right away: the picker usually asked already (then there's no second prompt).
+  let perm = await handle.queryPermission({ mode: "readwrite" }).catch(() => "prompt");
+  if (perm !== "granted") perm = await handle.requestPermission({ mode: "readwrite" }).catch(() => "denied");
+  if (perm !== "granted") { await fileEditingBlocked(); return; }
   await idbSet("syncFolder", handle);
   await saveSyncFields({ folderName: handle.name });
-  if (await hasSyncPassphrase()) { syncToast(await folderSyncNow({ ask: true })); renderSettings(); }
-  else await afterConnect(`Folder “${handle.name}” chosen`);
+  if (await hasSyncPassphrase()) await syncOrOfferOverwrite();
+  else { focusSoon("passphrase"); toast(`Folder “${handle.name}” chosen – now choose your passphrase`); }
+  renderSettings();
+}
+
+// The browser's "File editing" site setting is "Don't allow sites to edit files": the folder picker is
+// refused without opening. Explain it and open that settings page (chrome:// also works in Brave and Helium).
+async function fileEditingBlocked() {
+  const origin = location.origin;   // chrome-extension://<id>
+  const go = await confirmDialog("Your browser blocks folder access",
+    "This browser is set to “Don’t allow sites to edit files”, so it refuses the folder picker. " +
+    "In the settings page that opens, either choose “Sites can ask to edit files”, or press Add next to " +
+    "“Allowed to edit files” and paste " + origin + " (it’s copied for you). Then come back and press Choose folder again.",
+    "Open settings");
+  if (!go) return;
+  try { await navigator.clipboard.writeText(origin); } catch (_) {}
+  chrome.tabs.create({ url: "chrome://settings/content/filesystem" });   // the "File editing" page
 }
 
 let folderSyncing = false;
@@ -2612,13 +2659,31 @@ async function load() {
   renderBoard();
 }
 
+let settingsPointerDown = false, settingsRenderPending = false;
+document.addEventListener("pointerdown", e => { settingsPointerDown = $("settings").contains(e.target); }, true);
+const settingsPointerUp = () => {
+  if (!settingsPointerDown) return;
+  // setTimeout: runs after the click that follows this pointerup.
+  setTimeout(() => {
+    settingsPointerDown = false;
+    if (settingsRenderPending) { settingsRenderPending = false; if (!$("settingsView").classList.contains("hidden")) renderSettings(); }
+  }, 0);
+};
+document.addEventListener("pointerup", settingsPointerUp, true);
+document.addEventListener("pointercancel", settingsPointerUp, true);
+
 chrome.storage.onChanged.addListener((ch, area) => {
   if (area !== "local") return;
   if (ch.workflows || ch.activeWorkflowId || ch.looseTabs || ch.openWindows) load();
   if (ch.history) updateUndoBtn();
   if ((ch.history || ch.trash || ch.groupCopies) && !$("historyView").classList.contains("hidden")) renderHistory();
   const typingInSettings = $("settings").contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
-  if ((ch.backups || ch.syncStatus || ch.multiSyncStatus || ch.syncConfig) && !$("settingsView").classList.contains("hidden") && !typingInSettings) renderSettings();
+  if ((ch.backups || ch.syncStatus || ch.multiSyncStatus || ch.syncConfig) && !$("settingsView").classList.contains("hidden") && !typingInSettings) {
+    // Mid-click (e.g. leaving a login field saves it, then you release on Connect): redraw only after the click,
+    // or the button you're clicking is replaced and the click is lost.
+    if (settingsPointerDown) settingsRenderPending = true;
+    else renderSettings();
+  }
   if (ch.workflows || ch.looseTabs || ch.tombstones) scheduleFolderSync();
   if (ch.updateNotice) maybeShowUpdate();
 });
@@ -2756,10 +2821,14 @@ function changelogNodes(text, mine) {
     const b = line.match(/^[*-]\s+(.*)/);
     if (b) {
       if (!list) { list = el("ul", { className: "cl-list" }); out.push(list); }
-      list.append(el("li", { textContent: b[1] }));
+      list.append(el("li", {}, boldNodes(b[1])));
     }
   }
   return out;
+}
+// "**text**" in a changelog line shows as bold (built as text nodes, never as HTML).
+function boldNodes(text) {
+  return String(text).split(/\*\*(.+?)\*\*/).map((part, i) => i % 2 ? el("strong", { textContent: part }) : document.createTextNode(part));
 }
 // A changelog without any "## <version>" sections (e.g. a placeholder): show every line as it is (as text).
 function plainChangelogNodes(text) {

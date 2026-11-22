@@ -111,6 +111,7 @@ Install it from the [**Chrome Web Store**](https://chromewebstore.google.com/det
 | `manifest.json` | Extension manifest (MV3) |
 | `background.js` | Autosave, window ↔ workflow tracking, switching and all workflow/tab edits |
 | `bg-extras.js` | Undo history, trash, tab groups, move current tab, backups, Chrome sync |
+| `webdav.js` | WebDAV client used by the Sync page (Connect) and background sync: login, redirects, check, read, write |
 | `context-menu.js` | Right-click menu: send / copy a tab or save a link into a workflow |
 | `popup.html/.css/.js` | The toolbar popup |
 | `manager.html/.css/.js` | The Session Manager (board, list, canvas, history, settings) |
@@ -145,7 +146,7 @@ can't read them. Browsers merge: the newest version of each workflow wins, delet
 
 | Method | Works in | How it syncs |
 |---|---|---|
-| **Chrome profile** | Chrome only | Your Chrome account (≈100 KB limit) |
+| **Chrome profile** | Chrome only | Your Chrome account (≈100 KB limit). Sign in to Chrome itself (not just google.com) with sync on and **Extensions** ticked; copies from your other profiles or computers are merged in automatically. |
 | **Shared folder** | Chrome, Helium, Brave (enable `brave://flags/#file-system-access-api`) | A folder you pick in each browser – on this PC, or a Dropbox/OneDrive/Google Drive folder for other computers. Syncs while the Session Manager page is open (on open, every 2 min, after changes). |
 | **GitHub Gist** | all | Private gist on your GitHub account; paste a token with only the "gist" scope. Automatic (every 5 min + after changes). |
 | **Your own server** | all | A free Cloudflare Worker you set up once – see `sync-server/README.md` (code in `sync-server/worker.js`). Automatic. |
