@@ -117,10 +117,15 @@ async function knownTabInfo() {
 
 const looksUnloaded = t => !t.title || t.title === t.url || t.url.endsWith(t.title) || t.title.startsWith("http");
 
+// "Keep pinned tabs open": pinned tabs belong to no workflow, so they're never saved into one.
+const keepPins = () => !!settings.keepPinnedTabs;
+const withoutPins = list => keepPins() ? list.filter(t => !t.pinned) : list;
+
 function savedWindowFrom(w, known, ginfo = new Map()) {
-  const a = w.tabs.findIndex(t => t.active);
+  const src = withoutPins(w.tabs);
+  const a = src.findIndex(t => t.active);
   const groups = {};
-  const tabs = w.tabs.map(t => {
+  const tabs = src.map(t => {
     const k = looksUnloaded(t) && known.get(t.url);
     const out = {
       url: t.url,
@@ -214,14 +219,54 @@ async function saveNow({ stamp = false } = {}) {
   for (const [id, saved] of groups) {
     const wf = workflows[id];
     if (wf.autosave === false) continue;
-    const windows = carryNames(JSON.parse(JSON.stringify(saved)), wf.windows);
+    const windows = carryNames(JSON.parse(JSON.stringify(saved)), wf.windows).filter(w => w.tabs.length);
     // Only a real change (tabs added/removed/moved, pinned, renamed, regrouped) counts as a newer version
     // for sync - switching tabs or a page title loading doesn't, so edits from other browsers aren't overruled.
     if (stamp || !wf.savedAt || tabShape(windows) !== tabShape(wf.windows)) wf.savedAt = snap.savedAt;
     wf.windows = windows;
     update.workflows = workflows;
   }
+  const pins = await pinnedUpdate(wins);
+  if (pins) update.pinnedTabs = pins;
   await chrome.storage.local.set(update);
+}
+
+// ---------- shared pinned tabs ("Keep pinned tabs open") ----------
+// pinnedTabs: { at, tabs: [{ url, title, favIconUrl }] } – the pinned tabs open here (each link once).
+// `at` only changes when the set of links changes, so it can be synced: the newest set wins.
+let pinsSettled = true;     // false while the browser is still restoring its tabs after a start
+const pinKey = tabs => scCanon([...new Set(tabs.map(t => t.url))].sort());
+
+function pinnedOpenNow(wins) {
+  const seen = new Set(), out = [];
+  for (const w of wins) for (const t of w.tabs) {
+    if (!t.pinned || seen.has(t.url)) continue;
+    seen.add(t.url);
+    out.push({ url: t.url, title: t.title || t.url, favIconUrl: t.favIconUrl || "" });
+  }
+  return out;
+}
+
+async function pinnedUpdate(wins) {
+  if (!keepPins() || !pinsSettled) return null;
+  const tabs = pinnedOpenNow(wins);
+  const { pinnedTabs } = await chrome.storage.local.get("pinnedTabs");
+  if (pinnedTabs && pinKey(pinnedTabs.tabs || []) === pinKey(tabs)) {
+    // Same links: only refresh titles / icons (no new `at`, so other browsers aren't overruled).
+    return scCanon(pinnedTabs.tabs) === scCanon(tabs) ? null : { at: pinnedTabs.at || 0, tabs };
+  }
+  return { at: Date.now(), tabs };
+}
+
+// Open `tabs` pinned at the front of a window, skipping links already pinned there.
+async function addPinnedTabs(windowId, tabs) {
+  const have = new Set((await chrome.tabs.query({ windowId, pinned: true }).catch(() => [])).map(t => t.url || t.pendingUrl));
+  let i = have.size;
+  for (const t of tabs) {
+    if (have.has(t.url)) continue;
+    have.add(t.url);
+    await chrome.tabs.create({ windowId, url: t.url, pinned: true, active: false, index: i++ }).catch(() => {});
+  }
 }
 
 function scheduleSave() {
@@ -255,6 +300,19 @@ chrome.windows.onCreated.addListener(win => {
     map[win.id] = activeWorkflowId;
     await chrome.storage.local.set({ openWindows: map });
   });
+});
+
+// "Copy into every window": a window you open yourself (Ctrl+N, …) gets the pinned tabs too.
+// (Windows a workflow switch opens get them in openInNewWindows.)
+chrome.windows.onCreated.addListener(win => {
+  if (win.type !== "normal" || win.incognito || switching) return;
+  if (!settings.keepPinnedTabs || !["every", "sync"].includes(settings.pinnedScope)) return;
+  setTimeout(() => enqueue(async () => {
+    if (switching) return;
+    const others = (await readWindows()).filter(w => w.windowId !== win.id);
+    const pins = pinnedOpenNow(others);
+    if (pins.length) await addPinnedTabs(win.id, pins);
+  }), 300);
 });
 
 // Closing a window keeps its workflow as last saved; the workflow just isn't open any more.
@@ -323,9 +381,11 @@ chrome.runtime.onInstalled.addListener(details => enqueue(async () => {
   }
   await saveNow();
 }));
+chrome.runtime.onStartup.addListener(() => { pinsSettled = false; });
 chrome.runtime.onStartup.addListener(() => enqueue(async () => {
   ensureAlarms();
   await waitForRestoredTabs();
+  pinsSettled = true;
   await reconcileWindows();
   const s = await getSettings();
   if (AUTO_SYNC_METHODS.includes(s.syncMethod) && s.syncApplyOnStartup) {
@@ -360,7 +420,13 @@ async function liveLayoutFor(id) {
   const wf = workflows[id];
   if (!wf || wf.autosave === false) return null;
   const map = await getOpenWindows();
-  const mine = (await readWindows()).filter(w => ownerOf(w.windowId, map, activeWorkflowId) === id);
+  let mine = (await readWindows()).filter(w => ownerOf(w.windowId, map, activeWorkflowId) === id);
+  if (keepPins() && mine.length) {
+    // Positions in a workflow don't count pinned tabs (they aren't saved in it); a window with only
+    // pinned tabs is where the workflow's first tabs go.
+    const stripped = mine.map(w => ({ ...w, tabs: w.tabs.filter(t => !t.pinned) }));
+    mine = stripped.some(w => w.tabs.length) ? stripped.filter(w => w.tabs.length) : [stripped[0]];
+  }
   if (mine.length) return mine;
   return id === activeWorkflowId && s.switchMode !== "windows" ? [] : null;
 }
@@ -571,7 +637,8 @@ async function deleteGroupCopy({ id }) {
 // Fill an existing window with a saved window's tabs, in order, then close the window's old tabs.
 // All tabs are created at once (in parallel), put in order with ONE move call, then old tabs go in ONE remove call.
 async function fillWindow(win, sw, keepManager, lazy = false) {
-  const oldTabs = (win.tabs || []).filter(t => !(keepManager && (t.url || t.pendingUrl || "").startsWith(MANAGER_URL)));
+  const oldTabs = (win.tabs || []).filter(t => !(keepManager && (t.url || t.pendingUrl || "").startsWith(MANAGER_URL))
+    && !(keepPins() && t.pinned));
   const managerTabs = (win.tabs || []).filter(t => !oldTabs.includes(t));
   // (The old workflow was already saved when the switch started.)
   // 1) The new workflow opens: its tabs are created in order and the right one is shown straight away…
@@ -586,7 +653,7 @@ async function fillWindow(win, sw, keepManager, lazy = false) {
     const mine = new Set(created.filter(Boolean).map(t => currentTabId(t.id)));
     const now = await chrome.tabs.query({ windowId: win.id }).catch(() => []);
     const left = now.filter(t => !mine.has(t.id) && !keep.has(t.id) && ![...keep].some(k => currentTabId(k) === t.id)
-      && !(keepManager && (t.url || t.pendingUrl || "").startsWith(MANAGER_URL)));
+      && !(keepManager && (t.url || t.pendingUrl || "").startsWith(MANAGER_URL)) && !(keepPins() && t.pinned));
     if (!left.length) break;
     console.warn(`Tab Workflows: ${left.length} old tab(s) were still open after switching – closing them`);
     await closeTabsArchivingGroups(left);
@@ -627,6 +694,17 @@ async function replaceAllTabs(savedWindows) {
   if (managerElsewhere && s.keepManagerOpen) {
     await chrome.tabs.create({ windowId: mainWin.id, url: MANAGER_URL, active: false }).catch(() => {});
   }
+  // Kept pinned tabs from windows that are about to close move into the main window (once per link).
+  if (keepPins()) {
+    const have = new Set((await chrome.tabs.query({ windowId: mainWin.id, pinned: true }).catch(() => [])).map(t => t.url || t.pendingUrl));
+    for (const w of others) for (const t of (w.tabs || []).filter(x => x.pinned).sort((a, b) => a.index - b.index)) {
+      const url = t.url || t.pendingUrl;
+      if (have.has(url)) continue;
+      have.add(url);
+      await chrome.tabs.move(t.id, { windowId: mainWin.id, index: -1 }).catch(() => {});
+      await chrome.tabs.update(t.id, { pinned: true }).catch(() => {});
+    }
+  }
   // Other windows close too – their groups are saved as copies and deleted the same way first.
   for (const w of others) {
     const grouped = (w.tabs || []).filter(t => typeof t.groupId === "number" && t.groupId >= 0);
@@ -643,9 +721,13 @@ async function openInNewWindows(id, savedWindows) {
   if (!savedWindows.length) savedWindows = EMPTY_WINDOWS();
   const s = await getSettings();
   const map = await getOpenWindows();
+  // "Copy into every workflow" / "every window": each workflow window that opens also gets the pinned tabs open now.
+  const copyPins = s.keepPinnedTabs && ["workflow", "every", "sync"].includes(s.pinnedScope)
+    ? pinnedOpenNow(await readWindows()) : [];
   for (let i = 0; i < savedWindows.length; i++) {
     const win = await openSavedWindow(savedWindows[i], { focused: i === 0 }, s.lazyLoad).catch(() => null);
     if (win) map[win.id] = id;
+    if (win && copyPins.length) await addPinnedTabs(win.id, copyPins);
   }
   await chrome.storage.local.set({ openWindows: map });
 }
@@ -712,7 +794,7 @@ async function saveAsWorkflow({ name, icon }) {
   const id = newId();
   workflows[id] = {
     id, name: name || "Untitled", icon: icon || "folder", autosave: settings.newWorkflowAutosave !== false,
-    createdAt: Date.now(), savedAt: snap.savedAt, windows: snap.windows
+    createdAt: Date.now(), savedAt: snap.savedAt, windows: snap.windows.filter(w => w.tabs.length)
   };
   // The windows that were saved now belong to the new workflow.
   const map = await getOpenWindows();
@@ -740,7 +822,7 @@ async function saveIntoWorkflow({ id }) {
   const mine = wins.filter(w => ownerOf(w.windowId, map, activeWorkflowId) === id);
   if (!mine.length) return false;
   const snap = await snapshotOf(mine);
-  workflows[id].windows = carryNames(JSON.parse(JSON.stringify(snap.windows)), workflows[id].windows);
+  workflows[id].windows = carryNames(JSON.parse(JSON.stringify(snap.windows)), workflows[id].windows).filter(w => w.tabs.length);
   workflows[id].savedAt = snap.savedAt;
   await persist({ workflows });
   return { name: workflows[id].name, tabs: snap.windows.reduce((n, w) => n + w.tabs.length, 0) };
@@ -794,11 +876,27 @@ async function deleteWorkflow({ id }) {
   await persist(update);
 }
 
-async function openWorkflow({ id }) {
+// pinned: what to do with pinned tabs still saved in the workflow (from before "Keep pinned tabs open"):
+// "pin" – open them pinned (they then belong to no workflow), "unpin" – they become normal tabs of the
+// workflow, "remove" – take them out of the workflow. Left out: Settings → "Workflows with pinned tabs".
+async function openWorkflow({ id, pinned }) {
   const { workflows, activeWorkflowId } = await loadState();
-  const target = workflows[id];
+  let target = workflows[id];
   if (!target || id === LOOSE) throw new Error("Workflow not found");
   const s = await getSettings();
+  let extraPins = [];
+  if (s.keepPinnedTabs && pinnedTabsIn(target).length) {
+    const how = ["pin", "unpin", "remove"].includes(pinned) ? pinned : (s.pinnedOnOpen !== "ask" ? s.pinnedOnOpen : "pin");
+    if (how === "pin") extraPins = pinnedTabsIn(target).map(t => ({ url: t.url, title: t.title, favIconUrl: t.favIconUrl }));
+    target = { ...target, savedAt: Date.now(), windows: (target.windows || []).map(w => {
+      if (how === "unpin") return { ...w, tabs: w.tabs.map(t => ({ ...t, pinned: false })) };
+      const active = w.tabs[w.activeIndex || 0];
+      const tabs = w.tabs.filter(t => !t.pinned);
+      return { ...w, tabs, activeIndex: Math.max(0, tabs.indexOf(active)) };
+    }).filter(w => w.tabs.length) };
+    workflows[id] = target;
+    await persist({ workflows });
+  }
 
   if (s.switchMode === "windows") {
     // Already open somewhere? Just bring that window to the front.
@@ -813,6 +911,7 @@ async function openWorkflow({ id }) {
     await claimUnownedWindows(activeWorkflowId);
     await withSwitching(async () => {
       await openInNewWindows(id, target.windows);
+      if (extraPins.length) { const [wid] = await windowsOf(id); if (wid) await addPinnedTabs(wid, extraPins); }
       await chrome.storage.local.set({ activeWorkflowId: id });
     });
     return;
@@ -822,6 +921,11 @@ async function openWorkflow({ id }) {
   await saveNow(); // save what is open right now (each workflow only if its autosave is on)
   await withSwitching(async () => {
     await replaceAllTabs(target.windows);
+    if (extraPins.length) {
+      const wins = (await chrome.windows.getAll({ windowTypes: ["normal"] })).filter(w => !w.incognito);
+      const main = wins.find(w => w.focused) || wins[0];
+      if (main) await addPinnedTabs(main.id, extraPins);
+    }
     await chrome.storage.local.set({ activeWorkflowId: id });
   });
 }
@@ -924,20 +1028,50 @@ async function moveTab({ from, to, copy = false }) {
   if (liveTab && !copy) await closeLiveTabs([liveTab.id], srcLayout);
 }
 
-// Move or copy several tabs (items = [{ win, idx }]) to the end of another workflow, keeping their order.
-// Works from last to first so earlier positions stay valid, inserting each at the same spot.
-async function moveTabs({ fromId, items = [], toId, copy = false }) {
-  if (!items.length || fromId === toId) return 0;
+// Move or copy several tabs (items = [{ win, idx }]) into a workflow, keeping their order.
+// win / at: the window and the position (in that window as it is now) to drop them before;
+// left out, they go to the end of the last window. Works inside one workflow too (reordering).
+// A model of both workflows (one key per tab) is kept in step with every single move, so each
+// moveTab gets the right positions even as earlier moves shift things around.
+async function moveTabs({ fromId, items = [], toId, copy = false, win = null, at = null }) {
+  if (!items.length) return 0;
+  if (fromId === toId && win == null && !copy) return 0;
   const { workflows } = await loadState();
-  const dst = workflows[toId];
-  if (!dst) return 0;
-  const win = Math.max(0, (dst.windows || []).length - 1);
-  const at = dst.windows && dst.windows[win] ? dst.windows[win].tabs.length : 0;
-  const lastFirst = items.slice().sort((a, b) => b.win - a.win || b.idx - a.idx);
-  for (const it of lastFirst) {
-    await moveTab({ from: { id: fromId, win: it.win, idx: it.idx }, to: { id: toId, win, idx: at }, copy });
+  const src = workflows[fromId], dst = workflows[toId];
+  if (!src || !dst) return 0;
+  const model = wf => ({ wins: (wf.windows || []).map((w, wi) => w.tabs.map((_, ti) => `${wi}:${ti}`)) });
+  const S = model(src);
+  const D = fromId === toId ? S : model(dst);
+  const toWin = win == null ? Math.max(0, D.wins.length - 1) : Math.max(0, Math.min(win, D.wins.length));
+  if (!D.wins[toWin]) D.wins[toWin] = [];
+  const T = D.wins[toWin];
+  const picked = new Set(items.map(it => `${it.win}:${it.idx}`));
+  // The tab the moved ones should end up in front of (never one of the moved tabs themselves).
+  let anchor = null;
+  if (at != null) {
+    for (let i = Math.max(0, at); i < T.length; i++) {
+      if (copy || S !== D || !picked.has(T[i])) { anchor = T[i]; break; }
+    }
   }
-  return items.length;
+  const find = (wins, key) => {
+    for (let wi = 0; wi < wins.length; wi++) { const ti = wins[wi].indexOf(key); if (ti >= 0) return { wi, ti }; }
+    return null;
+  };
+  const order = items.slice().sort((a, b) => a.win - b.win || a.idx - b.idx);
+  let prev = null, n = 0;
+  for (const it of order) {
+    const p = find(S.wins, `${it.win}:${it.idx}`);
+    if (!p) continue;
+    if (!copy) S.wins[p.wi].splice(p.ti, 1);
+    const idx = prev ? T.indexOf(prev) + 1 : anchor ? T.indexOf(anchor) : T.length;
+    await moveTab({ from: { id: fromId, win: p.wi, idx: p.ti }, to: { id: toId, win: D.wins.indexOf(T), idx }, copy });
+    prev = `+${n++}`;
+    T.splice(idx, 0, prev);
+    // moveTab drops windows that end up empty – do the same here so window numbers stay right.
+    S.wins = S.wins.filter(w => w.length || w === T);
+    if (D !== S) D.wins = D.wins.filter(w => w.length || w === T);
+  }
+  return n;
 }
 
 async function removeTabs({ id, items = [] }) {
@@ -1035,6 +1169,94 @@ async function focusTab({ id, win, idx }) {
     return;
   }
   await chrome.tabs.create({ url: tab.url, active: true }).catch(() => {});
+}
+
+// ---------- pinning from the Session Manager ----------
+const focusedNormalWindow = async () => {
+  const wins = (await chrome.windows.getAll({ windowTypes: ["normal"] })).filter(w => !w.incognito);
+  return wins.find(w => w.focused) || wins[0] || null;
+};
+
+// Pin or unpin a tab of a workflow. With "Keep pinned tabs open" a pinned tab belongs to no workflow:
+// it leaves the workflow and is opened (or stays open) as a shared pinned tab.
+async function setTabPinned({ id, win, idx, pinned }) {
+  const { workflows } = await loadState();
+  const wf = workflows[id];
+  const w = wf && wf.windows[win];
+  const tab = w && w.tabs[idx];
+  if (!tab) return;
+  const layout = await liveLayoutFor(id);
+  const liveTab = layout && layout[win] ? layout[win].tabs[idx] : null;
+
+  if (pinned && keepPins()) {
+    w.tabs.splice(idx, 1);
+    wf.windows = wf.windows.filter(x => x.tabs.length);
+    wf.windows.forEach(fixActive);
+    wf.savedAt = Date.now();
+    await persist({ workflows });
+    if (liveTab) await chrome.tabs.update(liveTab.id, { pinned: true }).catch(() => {});
+    else { const fw = await focusedNormalWindow(); if (fw) await addPinnedTabs(fw.id, [tab]); }
+    return;
+  }
+
+  // Saved in the workflow with its pinned flag; pinned tabs always sit at the front of their window.
+  w.tabs.splice(idx, 1);
+  tab.pinned = !!pinned;
+  const pinnedCount = w.tabs.filter(t => t.pinned).length;
+  w.tabs.splice(pinnedCount, 0, tab);
+  fixActive(w);
+  wf.savedAt = Date.now();
+  await persist({ workflows });
+  if (liveTab) await chrome.tabs.update(liveTab.id, { pinned: !!pinned }).catch(() => {});
+}
+
+// The shared pinned tabs ("Keep pinned tabs open"), by link.
+async function openPinnedCopies(url) {
+  const tabs = await chrome.tabs.query({ pinned: true });
+  return tabs.filter(t => (t.url || t.pendingUrl) === url);
+}
+
+// Go to a shared pinned tab (the one in the focused window if there are copies); reopen it if it's gone.
+async function focusPinned({ url }) {
+  const fw = await focusedNormalWindow();
+  const copies = await openPinnedCopies(url);
+  const t = copies.find(x => fw && x.windowId === fw.id) || copies[0];
+  if (t) {
+    await chrome.tabs.update(t.id, { active: true }).catch(() => {});
+    await chrome.windows.update(t.windowId, { focused: true }).catch(() => {});
+  } else if (fw) {
+    await addPinnedTabs(fw.id, [{ url }]);
+  }
+}
+
+// Forget a link from the shared pinned set right away (saveNow would only notice once tabs change).
+async function dropSharedPin(url) {
+  const { pinnedTabs } = await chrome.storage.local.get("pinnedTabs");
+  if (!pinnedTabs || !(pinnedTabs.tabs || []).some(t => t.url === url)) return;
+  await chrome.storage.local.set({ pinnedTabs: { at: Date.now(), tabs: pinnedTabs.tabs.filter(t => t.url !== url) } });
+}
+
+// Unpin a shared pinned tab: the copy in your window becomes a normal tab of the workflow you're in;
+// copies in other windows close.
+async function unpinShared({ url }) {
+  const fw = await focusedNormalWindow();
+  const copies = await openPinnedCopies(url);
+  const keep = copies.find(x => fw && x.windowId === fw.id) || copies[0];
+  if (keep) await chrome.tabs.update(keep.id, { pinned: false }).catch(() => {});
+  const extra = copies.filter(x => x !== keep).map(x => x.id);
+  if (extra.length) await chrome.tabs.remove(extra).catch(() => {});
+  await dropSharedPin(url);
+}
+
+// Close a shared pinned tab everywhere.
+async function closeShared({ url }) {
+  const ids = (await openPinnedCopies(url)).map(t => t.id);
+  if (ids.length) {
+    const all = await chrome.tabs.query({ windowType: "normal" });
+    if (ids.length >= all.length) { const fw = await focusedNormalWindow(); if (fw) await chrome.tabs.create({ windowId: fw.id }).catch(() => {}); }
+    await chrome.tabs.remove(ids).catch(() => {});
+  }
+  await dropSharedPin(url);
 }
 
 function hostOf(url) {
@@ -1153,7 +1375,7 @@ async function openManager({ view } = {}) {
 const handlers = {
   saveAsWorkflow, saveIntoWorkflow, editWorkflow, setAutosave, deleteWorkflow,
   openWorkflow, createWorkflow, createEmptyWorkflow,
-  moveTab, moveTabs, removeTab, removeTabs, addTab, editTab, focusTab, sortWorkflow, dedupeWorkflow, clearWorkflow,
+  moveTab, moveTabs, removeTab, removeTabs, addTab, editTab, focusTab, setTabPinned, focusPinned, unpinShared, closeShared, sortWorkflow, dedupeWorkflow, clearWorkflow,
   importWorkflows, clearAllData, openManager, saveCurrent,
   addDivider, editDivider, removeLabel, insertDividerTab, restoreWorkflowCopy,
   undo, undoTo, clearHistory, restoreFromTrash, deleteFromTrash, emptyTrash, openGroupCopy, deleteGroupCopy,

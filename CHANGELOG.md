@@ -1,22 +1,19 @@
 # Changelog
 
-## 1.0.3
+## 1.0.4
 
 ### Added
-* **Chrome profile sync merges automatically.** When a copy from another Chrome profile or computer arrives, it's merged in right away (the newest version of each workflow wins), and the combined result is sent back a minute later. Deleted workflows are removed everywhere too. Before, each profile just overwrote the other's copy unless you pressed Merge in quickly enough. Merge in and Replace are still there.
+* **Select tabs by hovering.** Hover a tab and its site icon turns into a checkbox. Once one tab is ticked, every tab shows a checkbox, and clicking a row ticks it too. Shift+click ticks a range, Ctrl+click ticks a tab straight away, and Esc clears the selection. You can tick tabs in several workflows at once.
+* **Selection bar.** While tabs are ticked, a bar at the bottom of the page shows how many are selected, with Move to…, Copy to…, Open, Copy links, Trash, Select all / Deselect all and ✕ to close it.
+* **Drag several tabs at once.** Dragging one of the ticked tabs takes all of them along, shown as a stack with a count, and drops them exactly where you let go – also inside the same workflow. Hold Ctrl while dropping to copy them.
+* **Right-click menu on tabs.** Open, Edit name and link, Copy link, Move to…, Copy to…, Duplicate, Add a divider above, Pin tab / Unpin tab, Select and Remove. Right-click a ticked tab to act on every ticked tab.
+* **Keep pinned tabs open** (Settings → Switching, off by default). Pinned tabs belong to no workflow: switching only closes and opens your normal tabs, and pinned tabs stay. Unpin a tab to make it part of the workflow you're in. Pinned tabs can stay in their window, be copied into every workflow you open, be copied into every new browser window (also ones you open yourself), or do that and stay the same on all your browsers through sync.
+* **Pinned tabs show in every workflow.** With Keep pinned tabs open on, each workflow lists your pinned tabs at the top. Double-click one to go to it, or right-click to unpin or close it.
+* **Older workflows with pinned tabs saved in them.** When you open one, you're asked whether to pin those tabs, open them as normal tabs or remove them from the workflow. Tick "Do this every time", or set it in Settings → Switching.
 
 ### Changed
-* **Simpler sync setup.** Every method is set up one step at a time, and each step stays on the page once it's done. WebDAV: folder address → Next (asks for permission to reach it right away), username and app password → Connect (tells you if the folder doesn't exist or the login is wrong), then your passphrase → Save. Shared folder: Choose folder (access is asked for right then), then your passphrase → Save. The address and username stay in their fields, stored encrypted.
-* **Rebuilt WebDAV sync.** Connect and the background syncing now use the same WebDAV code, so "Connected" means syncing will work. Connect really tests the folder by saving a small test file there (and deleting it), and creates the folder if it's missing. If it fails, the reason stays in red under the login, naming the address that answered and the storage's own words. Example address for OxiCloud: http://<server>:8086/webdav/.
-* **Every connection needs its own passphrase.** A passphrase saved for one sync method is no longer carried over when you switch to another, and Disconnect forgets it, so connecting always means creating a passphrase first. Nothing syncs until it's there. Once saved, its field says "Type to change". The passphrase itself is never stored.
-* **Your WebDAV app password stays hidden.** Once you've connected, it never comes back into the page: the field just says "Saved", the eye button only shows what you're typing right now, and Connect uses the saved password when the field is empty. A password that fails Connect isn't stored.
-* **Reconnect button.** When a sync connection shows red ("Disconnected"), the button next to it is now Reconnect, which tries again right away. Disconnect shows while it's connected.
-* **Clearer WebDAV access.** Next asks for access to the exact address, port included (e.g. :8086), and tells you when access was already allowed instead of looking like nothing happened.
+* **Collapsing and expanding a workflow is animated.** The workflow glides open and closed instead of jumping.
+* The "Select tabs" checkbox above the first tab and the buttons that replaced a workflow's header while selecting are gone – the checkboxes and the selection bar do this now.
 
 ### Fixed
-* **Shared folder in Brave and Helium.** Choose folder did nothing when the browser's "File editing" setting is "Don't allow sites to edit files". It now explains what's blocking it, copies the extension's address for you and opens the File editing settings page, where you can allow it.
-* **WebDAV redirects.** WebDAV didn't connect when the storage sends http:// on to https:// (common on home NAS boxes). Next now asks for access to both, and your login is sent again to the new address (the browser drops it on a redirect). If the request is still blocked, the message says why (no access yet, or a self-signed certificate) instead of only "check your internet connection".
-* **WebDAV "error 400" and "404".** Some NAS storage answered Connect with "error 400"; the check now sends a standard WebDAV request. An address with no WebDAV folder could also pass Connect and then fail every sync with "404 Not Found" – the test file now catches that.
-* **"Wrong passphrase" after changing it.** The synced copy is now first updated with the old passphrase, then written again with the new one. If a copy made with another passphrase is still there, the message says to press Overwrite synced copy when this browser has your newest workflows.
-* **Old synced copy blocking the first sync.** When the folder or storage still holds a copy made with another passphrase (e.g. from an earlier setup), you're now asked right away whether to replace it with this browser's workflows.
-* **Connect doing nothing.** Clicking Connect right after typing your password or token lost the click (and could empty the field). The page now waits until the click is done.
+* **Empty space after moving tabs out of a workflow.** On the canvas, a workflow you had resized kept its height after tabs were moved out, leaving a big gap. It now shrinks to fit its tabs; the size you dragged it to is the most it grows to.

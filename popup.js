@@ -199,9 +199,15 @@ function sendAndClose(type, payload) {
   setTimeout(() => window.close(), 60);
 }
 
-function openNow(wf, btn) {
+// pinned: what to do with pinned tabs still saved in the workflow ("Keep pinned tabs open" is on).
+function openNow(wf, btn, pinned) {
+  const open = openWorkflowIds(state).has(wf.id);
+  if (!open && pinned === undefined && settings.keepPinnedTabs && pinnedTabsIn(wf).length) {
+    if (settings.pinnedOnOpen === "ask") { pendingConfirm = { id: wf.id, kind: "pins" }; render(); return; }
+    pinned = settings.pinnedOnOpen;
+  }
   if (btn) busy(btn, "Opening…");
-  sendAndClose("openWorkflow", { id: wf.id });
+  sendAndClose("openWorkflow", { id: wf.id, pinned });
 }
 
 function confirmBox(wf, kind) {
@@ -226,6 +232,16 @@ function confirmBox(wf, kind) {
         await send("deleteWorkflow", { id: wf.id });
         load();
       } } })
+    ]);
+  }
+
+  if (kind === "pins") {
+    const n = pinnedTabsIn(wf).length;
+    const pick = how => e => { pendingConfirm = null; openNow(wf, e.currentTarget, how); };
+    return box("", `“${wf.name}” has ${plural(n, "pinned tab")} saved in it. Pinned tabs now stay open across workflows – pin them, open them as normal tabs of this workflow, or remove them from it?`, [
+      el("button", { className: "btn sm", textContent: "Remove", title: "Take them out of this workflow", on: { click: pick("remove") } }),
+      el("button", { className: "btn sm", textContent: "Normal tabs", title: "Open them unpinned, as part of this workflow", on: { click: pick("unpin") } }),
+      el("button", { className: "btn sm primary", textContent: "Pin", title: "Open them pinned; they stay open when you switch", on: { click: pick("pin") } })
     ]);
   }
 

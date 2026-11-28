@@ -35,8 +35,17 @@ const DEFAULT_SETTINGS = {
   switchMode: "replace",    // "replace" = swap tabs in the current window | "windows" = each workflow in its own window
   lazyLoad: true,          // only the visible tab loads; others load when clicked
   confirmSwitch: true,
-  keepManagerOpen: true
+  keepManagerOpen: true,
+  // pinned tabs
+  keepPinnedTabs: false,    // pinned tabs belong to no workflow: they stay open when you switch
+  pinnedScope: "window",    // with keepPinnedTabs: "window" (stay in their window) | "workflow" (copied into each
+                            // workflow you open in a new window) | "every" (copied into every new browser window, also
+                            // ones you open yourself) | "sync" (every window, and the same pinned tabs on all your browsers)
+  pinnedOnOpen: "ask"       // a workflow that still has pinned tabs saved in it: "ask" | "pin" | "unpin" | "remove"
 };
+
+// A workflow whose saved tabs include pinned ones (only matters while "Keep pinned tabs open" is on).
+const pinnedTabsIn = wf => ((wf && wf.windows) || []).flatMap(w => (w.tabs || []).filter(t => t.pinned));
 
 async function getSettings() {
   const { settings = {} } = await chrome.storage.local.get("settings");

@@ -106,7 +106,7 @@ async function historyMax() {
 
 // Things the Session Manager and the popup can undo, with a readable label.
 const UNDOABLE = new Set([
-  "deleteWorkflow", "removeTab", "removeTabs", "moveTab", "moveTabs", "clearWorkflow", "dedupeWorkflow",
+  "deleteWorkflow", "removeTab", "removeTabs", "moveTab", "moveTabs", "setTabPinned", "clearWorkflow", "dedupeWorkflow",
   "sortWorkflow", "editTab", "editWorkflow", "addTab", "createEmptyWorkflow", "importWorkflows",
   "clearAllData", "restoreFromTrash", "restoreBackup", "addDivider", "editDivider", "removeLabel", "restoreWorkflowCopy"
 ]);
@@ -127,6 +127,7 @@ async function undoLabel(type, p) {
     case "dedupeWorkflow": return `Remove duplicates in ${n(p.id)}`;
     case "sortWorkflow": return `Sort ${n(p.id)}`;
     case "editTab": return `Edit a tab in ${n(p.id)}`;
+    case "setTabPinned": return `${p.pinned ? "Pin" : "Unpin"} a tab in ${n(p.id)}`;
     case "editWorkflow": return `Edit ${n(p.id)}`;
     case "addTab": return `Add a tab to ${n(p.id)}`;
     case "createEmptyWorkflow": return `Create “${p.name || "Untitled"}”`;
@@ -384,11 +385,12 @@ async function gunzipB64(b64) {
 async function syncNow() {
   const s = await getSettings();
   if (s.syncMethod !== "chrome" || !chrome.storage.sync) return null;
-  const { workflows = {}, looseTabs = [], tombstones = {} } = await chrome.storage.local.get(["workflows", "looseTabs", "tombstones"]);
+  const { workflows = {}, looseTabs = [], tombstones = {}, pinnedTabs = null } =
+    await chrome.storage.local.get(["workflows", "looseTabs", "tombstones", "pinnedTabs"]);
   const device = await getDeviceId();
   const at = Date.now();
   // Tombstones: so a workflow deleted here is also deleted in the other profiles when they merge.
-  const b64 = await gzipB64(JSON.stringify({ v: 1, at, device, workflows, looseTabs, tombstones }));
+  const b64 = await gzipB64(JSON.stringify({ v: 1, at, device, workflows, looseTabs, tombstones, ...(pinnedTabs ? { pinnedTabs } : {}) }));
   if (b64.length > SYNC_LIMIT) {
     const status = { ok: false, at, size: b64.length,
       error: "Your workflows are too big for Chrome sync (about 90 KB after compression). Daily backup files still work." };
@@ -461,7 +463,7 @@ async function syncPull({ mode = "merge" }) {
 
 // Push changes to sync about a minute after they happen (Chrome limits how often sync may be written).
 chrome.storage.onChanged.addListener((ch, area) => {
-  if (area !== "local" || !(ch.workflows || ch.looseTabs)) return;
+  if (area !== "local" || !(ch.workflows || ch.looseTabs || ch.pinnedTabs)) return;
   if (settings.syncMethod === "chrome") chrome.alarms.create("sync-push", { delayInMinutes: 1 });
 });
 
@@ -553,9 +555,10 @@ async function setMultiSyncStatus(st) {
 const sharedSettings = s => Object.fromEntries(Object.entries(s).filter(([k]) => !LOCAL_ONLY_SETTINGS.includes(k)));
 
 async function buildSyncPayload() {
-  const { workflows = {}, looseTabs = [], tombstones = {}, settingsAt = 0 } =
-    await chrome.storage.local.get(["workflows", "looseTabs", "tombstones", "settingsAt"]);
+  const { workflows = {}, looseTabs = [], tombstones = {}, settingsAt = 0, pinnedTabs = null } =
+    await chrome.storage.local.get(["workflows", "looseTabs", "tombstones", "settingsAt", "pinnedTabs"]);
   const payload = { v: 2, at: Date.now(), device: await getDeviceId(), workflows, looseTabs, tombstones };
+  if (pinnedTabs) payload.pinnedTabs = pinnedTabs;
   await addVersionInfo(payload);
   const s = await getSettings();
   if (s.syncSettings) { payload.settings = sharedSettings(s); payload.settingsAt = settingsAt; }
@@ -595,6 +598,7 @@ function tabShape(windows) {
 async function mergeRemote(remote) {
   await mergeRemoteSettings(remote);
   await checkVersions(remote);
+  await mergeRemotePins(remote);
   if (remote && remote.workflows) {
     const { workflows = {}, looseTabs = [], tombstones = {}, activeWorkflowId = null } =
       await chrome.storage.local.get(["workflows", "looseTabs", "tombstones", "activeWorkflowId"]);
@@ -625,6 +629,45 @@ async function mergeRemote(remote) {
     }
   }
   return buildSyncPayload();
+}
+
+// Shared pinned tabs ("Keep pinned tabs open"): the newest set wins. It's always kept in the synced copy;
+// with "Every window, on all your browsers" a newer set from another browser also changes the pinned tabs
+// open here: missing ones open pinned in every window, ones unpinned or closed there close here.
+async function mergeRemotePins(remote) {
+  const r = remote && remote.pinnedTabs;
+  if (!r || !Array.isArray(r.tabs)) return;
+  const { pinnedTabs: l = null } = await chrome.storage.local.get("pinnedTabs");
+  if (l && (l.at || 0) >= (r.at || 0)) return;
+  syncApplying = true;
+  try { await chrome.storage.local.set({ pinnedTabs: { at: r.at || Date.now(), tabs: r.tabs } }); }
+  finally { setTimeout(() => { syncApplying = false; }, 200); }
+  const s = await getSettings();
+  if (!s.keepPinnedTabs || s.pinnedScope !== "sync") return;
+  const want = new Set(r.tabs.map(t => t.url));
+  const before = new Set(((l && l.tabs) || []).map(t => t.url));
+  pauseAutosave();
+  try {
+    const wins = (await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] })).filter(w => !w.incognito);
+    const close = [];
+    for (const w of wins) {
+      const mine = (w.tabs || []).filter(t => {
+        const url = t.url || t.pendingUrl;
+        // Only close what was in the old shared set (so a tab you pinned here just now isn't lost).
+        return t.pinned && before.has(url) && !want.has(url);
+      });
+      await addPinnedTabs(w.id, r.tabs);
+      // Never leave a window with nothing in it (closing its last tab would close the window).
+      if (mine.length && mine.length === (w.tabs || []).length && !r.tabs.length) {
+        await chrome.tabs.create({ windowId: w.id, active: true }).catch(() => {});
+      }
+      close.push(...mine.map(t => t.id));
+    }
+    if (close.length) await chrome.tabs.remove(close).catch(() => {});
+  } finally {
+    resumeAutosave();
+    setTimeout(() => enqueue(saveNow), 800);
+  }
 }
 
 // ---- where the encrypted file lives ----
@@ -737,7 +780,7 @@ async function syncMergeRemote({ remote = null } = {}) {
 // Sync shortly after changes (`syncDelay`), and every `syncInterval` minutes.
 chrome.storage.onChanged.addListener((ch, area) => {
   if (area !== "local" || syncApplying) return;
-  if (!(ch.workflows || ch.looseTabs || ch.tombstones || (ch.settingsAt && settings.syncSettings))) return;
+  if (!(ch.workflows || ch.looseTabs || ch.tombstones || ch.pinnedTabs || (ch.settingsAt && settings.syncSettings))) return;
   if (AUTO_SYNC_METHODS.includes(settings.syncMethod)) {
     chrome.alarms.create("msync-soon", { delayInMinutes: Math.max(0.5, Number(settings.syncDelay) || DEFAULT_SETTINGS.syncDelay) });
   }
@@ -874,7 +917,20 @@ async function insertDividerTab({ text = "", color = "grey" } = {}) {
 
 chrome.commands && chrome.commands.onCommand.addListener(cmd => {
   if (cmd === "insert-divider") enqueue(() => insertDividerTab());
+  if (cmd === "open-manager") focusOrOpenManager().catch(() => {});
 });
+
+// Shortcut: bring the Session Manager to the front (without reloading it), or open it in a new tab.
+async function focusOrOpenManager() {
+  const tabs = await chrome.tabs.query({});
+  const existing = tabs.find(t => (t.url || t.pendingUrl || "").startsWith(MANAGER_URL));
+  if (existing) {
+    await chrome.tabs.update(existing.id, { active: true });
+    await chrome.windows.update(existing.windowId, { focused: true });
+  } else {
+    await chrome.tabs.create({ url: MANAGER_URL });
+  }
+}
 
 // ======================= Backup copies of each workflow =======================
 // Every workflow keeps its last 3 earlier versions (in this browser only, not synced).

@@ -150,19 +150,27 @@ async function importFile(file) {
 
 // ---------- menu ----------
 function closeMenu() { $("menu").classList.add("hidden"); }
-function openMenu(anchor, items) {
+function fillMenu(items) {
   const m = $("menu");
   m.innerHTML = "";
   for (const it of items) {
-    if (it === "sep") { m.append(el("hr")); continue; }
+    if (!it) continue;
+    if (it === "sep") { if (m.lastChild && m.lastChild.tagName !== "HR") m.append(el("hr")); continue; }
+    if (it.heading) { m.append(el("div", { className: "menu-head", textContent: it.heading })); continue; }
     m.append(el("button", {
       className: it.danger ? "danger" : "", role: "menuitem",
-      html: svgIcon(it.icon, 15) + `<span></span>`,
+      html: svgIcon(it.icon, 15) + `<span></span>` + (it.hint ? `<kbd></kbd>` : ""),
       on: { click: () => { closeMenu(); it.action(); } }
     }));
     m.lastChild.querySelector("span").textContent = it.label;
+    if (it.hint) m.lastChild.querySelector("kbd").textContent = it.hint;
   }
+  if (m.lastChild && m.lastChild.tagName === "HR") m.lastChild.remove();
   m.classList.remove("hidden");
+  return m;
+}
+function openMenu(anchor, items) {
+  const m = fillMenu(items);
   const r = anchor.getBoundingClientRect();
   const w = m.offsetWidth, h = m.offsetHeight;
   let left = Math.min(r.right - w, window.innerWidth - w - 8);
@@ -171,6 +179,15 @@ function openMenu(anchor, items) {
   m.style.left = Math.max(8, left) + "px";
   m.style.top = top + "px";
 }
+// Right-click menus: open at the pointer, flipped to stay on screen.
+function openMenuAt(x, y, items) {
+  const m = fillMenu(items);
+  const w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.max(8, x + w > window.innerWidth - 8 ? x - w : x) + "px";
+  m.style.top = Math.max(8, y + h > window.innerHeight - 8 ? y - h : y) + "px";
+}
+window.addEventListener("blur", closeMenu);
+document.addEventListener("scroll", closeMenu, true);
 document.addEventListener("mousedown", e => { if (!$("menu").contains(e.target)) closeMenu(); });
 
 // ---------- modal dialogs ----------
@@ -260,9 +277,50 @@ async function openWorkflow(wf) {
       else if (!(await confirmDialog(`Open “${wf.name}” without saving?`, "Unsaved changes in the current workflow will be lost.", "Open anyway", true))) return;
     } else if (!(await confirmDialog(`Open “${wf.name}”?`, notice.text, notice.risky ? "Open anyway" : "Open", notice.risky))) return;
   }
+  let pinned;
+  if (settings.keepPinnedTabs && pinnedTabsIn(wf).length) {
+    pinned = settings.pinnedOnOpen;
+    if (pinned === "ask") { pinned = await pinnedChoiceDialog(wf); if (!pinned) return; }
+  }
   toast(`Opening “${wf.name}”…`);
-  const res = await send("openWorkflow", { id: wf.id });
+  const res = await send("openWorkflow", { id: wf.id, pinned });
   if (!res.ok) toast("Couldn’t open: " + res.error);
+}
+
+// "Keep pinned tabs open" is on, and this workflow still has pinned tabs saved in it (from before).
+function pinnedChoiceDialog(wf) {
+  const pins = pinnedTabsIn(wf);
+  return new Promise(resolve => {
+    const m = $("modal");
+    const remember = el("input", { type: "checkbox" });
+    const done = v => {
+      closeModal();
+      if (v && remember.checked) setSetting("pinnedOnOpen", v);
+      resolve(v);
+    };
+    const option = (how, icon, name, meta) => el("button", { className: "target", on: { click: () => done(how) } }, [
+      el("span", { className: "tile", html: svgIcon(icon, 17) }),
+      el("span", { className: "target-text" }, [el("span", { className: "target-name", textContent: name }), el("span", { className: "target-meta", textContent: meta })])
+    ]);
+    const list = el("div", { className: "target-list" }, [
+      option("pin", "pin", "Pin them", "They open pinned and stay open like your other pinned tabs – no longer part of this workflow"),
+      option("unpin", "list", "Open as normal tabs", "They become normal tabs of this workflow and close when you switch away"),
+      option("remove", "trash", "Remove them", "Take them out of this workflow and open the rest")
+    ]);
+    const names = pins.slice(0, 3).map(t => t.name || t.title || t.url).join(", ") + (pins.length > 3 ? ` and ${pins.length - 3} more` : "");
+    m.innerHTML = "";
+    m.append(el("div", { className: "dialog", role: "dialog", "aria-modal": "true" }, [
+      el("h2", { textContent: `“${wf.name}” has ${plural(pins.length, "pinned tab")}` }),
+      el("p", { textContent: `Pinned tabs now stay open across workflows instead of being saved in one. What should happen to ${names}?` }),
+      list,
+      el("label", { className: "remember" }, [remember, el("span", { textContent: "Do this every time (change it in Settings → Switching)" })]),
+      el("div", { className: "buttons" }, [el("button", { className: "btn ghost", textContent: "Cancel", on: { click: () => done(null) } })])
+    ]));
+    m.classList.remove("hidden");
+    m.onmousedown = e => { if (e.target === m) done(null); };
+    m._cancel = () => done(null);
+    setTimeout(() => { const f = list.querySelector("button"); f && f.focus(); }, 0);
+  });
 }
 
 async function deleteWorkflow(wf) {
@@ -374,7 +432,8 @@ function clearDropUi() {
 }
 
 function rowBefore(ul, y, x) {
-  const rows = [...ul.querySelectorAll(".tab-row")].filter(r => !r.classList.contains("hide") && r !== dragging.row);
+  const rows = [...ul.querySelectorAll(".tab-row")].filter(r => !r.classList.contains("hide") && r !== dragging.row
+    && !(dragging.multi && r.classList.contains("picked")));
   const grid = settings.density === "icons";
   for (const r of rows) {
     const b = r.getBoundingClientRect();
@@ -424,6 +483,11 @@ function attachListDrop(ul) {
     e.preventDefault();
     e.stopPropagation();
     const before = rowBefore(ul, e.clientY, e.clientX);
+    if (dragging.multi) {
+      clearDropUi();
+      multiDrop(ul.dataset.id, +ul.dataset.win, before ? +before.dataset.idx : null, e.ctrlKey);
+      return;
+    }
     const to = targetFor(ul, before, e.ctrlKey);
     clearDropUi();
     doDrop(to, e.ctrlKey);
@@ -443,6 +507,7 @@ function attachCardDrop(card, head, wf) {
     e.preventDefault();
     const wins = wf.windows || [];
     const win = Math.max(0, wins.length - 1);
+    if (dragging.multi) { clearDropUi(); multiDrop(wf.id, win, null, e.ctrlKey); return; }
     const total = wins[win] ? wins[win].tabs.length : 0;
     const same = dragging.from.id === wf.id && dragging.from.win === win && !e.ctrlKey;
     clearDropUi();
@@ -453,22 +518,27 @@ function attachCardDrop(card, head, wf) {
   });
 }
 
-// ---------- selecting several tabs (per workflow card) ----------
+// ---------- selecting several tabs ----------
+// Hover a tab and tick the box that replaces its icon; once one tab is ticked, every tab shows a box.
+// Tabs can be ticked in several workflows at once.
 // selection: workflowId -> { keys: Set("win:idx"), last: "win:idx" | null }
 const selection = new Map();
 const selFor = id => selection.get(id);
 const keyOf = (wi, ti) => `${wi}:${ti}`;
 const allKeys = wf => (wf.windows || []).flatMap((w, wi) => w.tabs.map((_, ti) => keyOf(wi, ti)));
+const wfById = id => id === LOOSE ? looseWorkflow() : state.workflows[id];
+const selCount = () => [...selection.values()].reduce((n, s) => n + s.keys.size, 0);
+const isPicked = (id, wi, ti) => !!selFor(id) && selFor(id).keys.has(keyOf(wi, ti));
 
-function setSelectMode(wf, on) {
-  if (on) selection.set(wf.id, { keys: new Set(), last: null });
-  else selection.delete(wf.id);
+function clearSelection() {
+  if (!selection.size) return;
+  selection.clear();
   renderBoard();
 }
 
 function toggleTabSelected(wf, wi, ti, shift) {
-  const sel = selFor(wf.id);
-  if (!sel) return;
+  let sel = selFor(wf.id);
+  if (!sel) { sel = { keys: new Set(), last: null }; selection.set(wf.id, sel); }
   const k = keyOf(wi, ti);
   if (shift && sel.last && sel.last.split(":")[0] === String(wi)) {
     // Shift-click: tick everything between the last clicked tab and this one (same window).
@@ -478,42 +548,67 @@ function toggleTabSelected(wf, wi, ti, shift) {
   } else if (sel.keys.has(k)) sel.keys.delete(k);
   else sel.keys.add(k);
   sel.last = k;
+  if (!sel.keys.size) selection.delete(wf.id);
   renderBoard();
 }
 
-// The checkbox row above the first tab.
-function selectBar(wf, total) {
-  const sel = selFor(wf.id);
-  if (sel) { const valid = new Set(allKeys(wf)); sel.keys.forEach(k => { if (!valid.has(k)) sel.keys.delete(k); }); }
-  const n = sel ? sel.keys.size : 0;
-  const cb = el("input", { type: "checkbox", className: "sel-check", checked: !!sel && n > 0 && n === total,
-    title: !sel ? "Select tabs" : n === total ? "Select none" : "Select all" });
-  cb.indeterminate = !!sel && n > 0 && n < total;
-  cb.addEventListener("change", () => {
-    if (!sel) return setSelectMode(wf, true);
-    if (n === total) sel.keys.clear();
-    else allKeys(wf).forEach(k => sel.keys.add(k));
-    renderBoard();
-  });
-  return el("div", { className: "select-bar" + (sel ? " on" : "") }, [
-    el("label", {}, [cb, el("span", { textContent: !sel ? "Select tabs" : n ? `${n} of ${total} selected` : "Tick the tabs you want" })]),
-    sel ? el("button", { className: "sel-done", textContent: "Done", title: "Stop selecting", on: { click: () => setSelectMode(wf, false) } }) : null
-  ]);
+// Every workflow that has ticked tabs gets all of its tabs ticked.
+function selectAllInSelected() {
+  for (const [id, sel] of selection) { const wf = wfById(id); if (wf) allKeys(wf).forEach(k => sel.keys.add(k)); }
+  renderBoard();
 }
 
-// Header buttons while tabs are ticked.
-function selectionActions(wf) {
-  const n = selFor(wf.id).keys.size;
-  return el("div", { className: "card-actions sel-actions" }, [
-    el("button", { className: "btn sm", html: svgIcon("copy", 14) + "Copy", title: `Copy ${plural(n, "tab")} to another workflow`,
-      on: { click: () => bulkAction(wf, "copy") } }),
-    el("button", { className: "btn sm primary", html: svgIcon("arrow", 14) + "Move", title: `Move ${plural(n, "tab")} to another workflow`,
-      on: { click: () => bulkAction(wf, "move") } }),
-    el("button", { className: "iconbtn flat danger", title: `Remove ${plural(n, "tab")}`, html: svgIcon("trash", 15),
-      on: { click: () => bulkAction(wf, "remove") } }),
-    el("button", { className: "iconbtn flat", title: "Cancel selection", html: svgIcon("close", 15),
-      on: { click: () => setSelectMode(wf, false) } })
-  ]);
+// Drop ticked tabs that no longer exist (moved, closed, synced away).
+function pruneSelection() {
+  for (const [id, sel] of selection) {
+    const wf = wfById(id);
+    if (!wf) { selection.delete(id); continue; }
+    const valid = new Set(allKeys(wf));
+    sel.keys.forEach(k => { if (!valid.has(k)) sel.keys.delete(k); });
+    if (!sel.keys.size) selection.delete(id);
+  }
+}
+
+const itemsOf = keys => [...keys].map(k => { const [win, idx] = k.split(":").map(Number); return { win, idx }; })
+  .sort((a, b) => a.win - b.win || a.idx - b.idx);
+function selectedGroups() {
+  return [...selection].map(([id, sel]) => ({ wf: wfById(id), items: itemsOf(sel.keys) })).filter(g => g.wf && g.items.length);
+}
+const tabAt = (wf, it) => wf.windows && wf.windows[it.win] && wf.windows[it.win].tabs[it.idx];
+
+// The floating bar at the bottom while tabs are ticked.
+function renderSelBar() {
+  let bar = $("selBar");
+  if (!bar) {
+    bar = el("div", { id: "selBar", className: "sel-bar", role: "toolbar", "aria-label": "Selected tabs" });
+    $("boardView").append(bar);
+  }
+  const n = selCount();
+  document.body.classList.toggle("selecting", n > 0);
+  bar.classList.toggle("show", n > 0);
+  bar.inert = n === 0;
+  if (!n) return;                     // keep the old content while it slides away
+  const groups = selectedGroups();
+  const total = groups.reduce((s, g) => s + countTabs(g.wf), 0);
+  const where = groups.length === 1 ? `in “${groups[0].wf.name}”` : `in ${plural(groups.length, "workflow")}`;
+  const btn = (icon, label, title, fn, cls = "") => {
+    const b = el("button", { className: "sb-btn " + cls, title, html: (icon ? svgIcon(icon, 15) : "") + "<span></span>", on: { click: fn } });
+    b.querySelector("span").textContent = label;
+    return b;
+  };
+  const all = n >= total;
+  bar.replaceChildren(
+    el("span", { className: "sb-count", textContent: `${n} selected`, title: `${plural(n, "tab")} selected ${where}` }),
+    btn("folder", "Move to…", `Move ${plural(n, "tab")} to another workflow`, () => bulkAction("move")),
+    btn("copy", "Copy to…", `Copy ${plural(n, "tab")} to another workflow`, () => bulkAction("copy")),
+    btn("external", "Open", `Open ${plural(n, "tab")} in the browser`, () => bulkAction("open")),
+    btn("link", "Copy links", "Copy the links to the clipboard", () => bulkAction("links")),
+    btn("trash", "Trash", `Remove ${plural(n, "tab")} (you can undo it, or restore them from the trash)`, () => bulkAction("remove"), "danger"),
+    // Select all ↔ Deselect all
+    all ? btn(null, "Deselect all", "Deselect every tab", clearSelection)
+        : btn(null, "Select all", `Select every tab ${where}`, selectAllInSelected),
+    el("button", { className: "sb-close", title: "Close (Esc)", "aria-label": "Close selection", html: svgIcon("close", 16), on: { click: clearSelection } })
+  );
 }
 
 // "Where to?" – pick a workflow, Unsorted tabs, or a new workflow.
@@ -547,24 +642,38 @@ function chooseTarget({ title, text, excludeId }) {
   });
 }
 
-async function bulkAction(wf, kind) {
-  const sel = selFor(wf.id);
-  if (!sel || !sel.keys.size) return;
-  const items = [...sel.keys].map(k => { const [win, idx] = k.split(":").map(Number); return { win, idx }; });
-  const n = items.length;
-  const live = isLive(wf);
+// kind: move | copy | remove | open | links. groups: [{ wf, items: [{ win, idx }] }] – the ticked tabs by default.
+async function bulkAction(kind, groups = selectedGroups()) {
+  const n = groups.reduce((s, g) => s + g.items.length, 0);
+  if (!n) return;
+  const single = groups.length === 1 ? groups[0].wf : null;
+  const live = groups.some(g => isLive(g.wf));
+  const fromSelection = groups.some(g => g.items.some(it => isPicked(g.wf.id, it.win, it.idx)));
 
+  if (kind === "links") {
+    const urls = groups.flatMap(g => g.items.map(it => tabAt(g.wf, it)).filter(Boolean).map(t => t.url));
+    try { await navigator.clipboard.writeText(urls.join("\n")); toast(`Copied ${plural(urls.length, "link")}`); }
+    catch (_) { toast("Couldn’t access the clipboard"); }
+    return;
+  }
+  if (kind === "open") {
+    if (n > 15 && !await confirmDialog(`Open ${n} tabs?`, "Each one opens as a tab in your browser.", "Open")) return;
+    for (const g of groups) for (const it of g.items) await send("focusTab", { id: g.wf.id, win: it.win, idx: it.idx });
+    return;
+  }
   if (kind === "remove") {
-    const ok = !settings.confirmDelete || await confirmDialog(`Remove ${plural(n, "tab")} from “${wf.name}”?`,
-      live ? "This workflow is open, so these tabs will be closed in the browser too." : "They’ll be removed from this workflow.", "Remove", true);
+    const from = single ? `from “${single.name}”` : `from ${plural(groups.length, "workflow")}`;
+    const ok = !settings.confirmDelete || await confirmDialog(`Remove ${plural(n, "tab")} ${from}?`,
+      live ? "Open workflows close these tabs in the browser too. You can undo this or restore them from the trash."
+        : "You can undo this or restore them from the trash in History.", "Remove", true);
     if (!ok) return;
-    await send("removeTabs", { id: wf.id, items });
+    for (const g of groups) await send("removeTabs", { id: g.wf.id, items: g.items });
     toast(`Removed ${plural(n, "tab")}`, undoAction);
   } else {
     let toId = await chooseTarget({
       title: `${kind === "copy" ? "Copy" : "Move"} ${plural(n, "tab")} to…`,
-      text: kind === "move" && live ? "This workflow is open, so moved tabs are closed here in the browser." : null,
-      excludeId: wf.id
+      text: kind === "move" && live ? "Tabs moved out of an open workflow are closed in its window." : null,
+      excludeId: single ? single.id : null
     });
     if (!toId) return;
     if (toId === "__new__") {
@@ -574,19 +683,117 @@ async function bulkAction(wf, kind) {
       if (!res.ok) return toast("Couldn’t create the workflow");
       toId = res.result;
     }
-    await send("moveTabs", { fromId: wf.id, items, toId, copy: kind === "copy" });
+    let done = 0;
+    for (const g of groups) {
+      if (g.wf.id === toId && kind === "move") continue;
+      await send("moveTabs", { fromId: g.wf.id, items: g.items, toId, copy: kind === "copy" });
+      done += g.items.length;
+    }
     const dst = toId === LOOSE ? "Unsorted tabs" : (state.workflows[toId] ? state.workflows[toId].name : "the new workflow");
-    toast(`${kind === "copy" ? "Copied" : "Moved"} ${plural(n, "tab")} to “${dst}”`, undoAction);
+    toast(`${kind === "copy" ? "Copied" : "Moved"} ${plural(done, "tab")} to “${dst}”`, undoAction);
   }
-  selection.delete(wf.id);
+  if (fromSelection) { selection.clear(); renderBoard(); }
+}
+
+// Dropping the ticked tabs (dragged together) into window `win` of workflow `toId`, before position `at`
+// (null = at the end). The tabs from the target workflow itself go first, then the others line up behind them.
+async function multiDrop(toId, win, at, copy) {
+  const groups = selectedGroups().sort((a, b) => (b.wf.id === toId) - (a.wf.id === toId));
+  const n = groups.reduce((s, g) => s + g.items.length, 0);
+  let toWin = win, pos = at;
+  for (const g of groups) {
+    await send("moveTabs", { fromId: g.wf.id, items: g.items, toId, copy, win: toWin, at: pos });
+    if (g.wf.id === toId && !copy) {
+      // Where the moved block ends, in the window as it is now, so the next group lands right behind it.
+      const wins = g.wf.windows || [];
+      const picked = new Set(g.items.map(it => keyOf(it.win, it.idx)));
+      const tw = wins[toWin] ? wins[toWin].tabs : [];
+      const end = pos == null ? tw.length : pos;
+      const stay = tw.filter((_, ti) => ti < end && !picked.has(keyOf(toWin, ti))).length;
+      toWin -= wins.filter((w, wi) => wi < toWin && w.tabs.every((_, ti) => picked.has(keyOf(wi, ti)))).length;
+      pos = pos == null ? null : stay + g.items.length;
+    } else if (pos != null) pos += g.items.length;
+  }
+  const dst = wfById(toId);
+  const same = groups.length === 1 && groups[0].wf.id === toId && !copy;
+  toast(same ? `Moved ${plural(n, "tab")}` : `${copy ? "Copied" : "Moved"} ${plural(n, "tab")} to “${dst ? dst.name : "workflow"}”`, undoAction);
+  selection.clear();
   renderBoard();
+}
+
+// A little stack of cards under the pointer while several tabs are dragged.
+function dragGhost(n) {
+  const rows = selectedGroups().flatMap(g => g.items.map(it => tabAt(g.wf, it))).filter(Boolean).slice(0, 3);
+  const ghost = el("div", { className: "drag-ghost" }, [
+    ...rows.map((t, i) => el("div", { className: "dg-row", style: `--k:${i}` }, [
+      favicon(t.url, t.favIconUrl),
+      el("span", { textContent: isDividerTab(t) ? (dividerOf(t.url).text || "Divider") : (t.name || t.title || t.url) })
+    ])),
+    el("span", { className: "dg-count", textContent: n })
+  ]);
+  document.body.append(ghost);
+  setTimeout(() => ghost.remove(), 0);
+  return ghost;
+}
+
+// ---------- right-click menu on a tab ----------
+function tabMenu(e, wf, wi, ti, t) {
+  e.preventDefault();
+  const n = selCount();
+  if (isPicked(wf.id, wi, ti) && n > 1) {
+    return openMenuAt(e.clientX, e.clientY, [
+      { heading: `${plural(n, "tab")} selected` },
+      { icon: "external", label: `Open ${n} tabs`, action: () => bulkAction("open") },
+      { icon: "arrow", label: "Move to…", action: () => bulkAction("move") },
+      { icon: "copy", label: "Copy to…", action: () => bulkAction("copy") },
+      { icon: "link", label: "Copy links", action: () => bulkAction("links") },
+      "sep",
+      { icon: "checks", label: "Select all", action: selectAllInSelected },
+      { icon: "close", label: "Deselect all", hint: "Esc", action: clearSelection },
+      "sep",
+      { icon: "trash", label: `Delete ${n} tabs`, danger: true, action: () => bulkAction("remove") }
+    ]);
+  }
+  const live = isLive(wf);
+  const one = [{ wf, items: [{ win: wi, idx: ti }] }];
+  const dv = isDividerTab(t) ? dividerOf(t.url) : null;
+  const picked = isPicked(wf.id, wi, ti);
+  openMenuAt(e.clientX, e.clientY, [
+    { icon: "external", label: live ? "Go to tab" : "Open in a new tab", action: () => send("focusTab", { id: wf.id, win: wi, idx: ti }) },
+    dv ? { icon: "edit", label: "Edit divider", action: async () => {
+          const r = await dividerDialog({ title: "Edit divider tab", text: dv.text, color: dv.color, kind: "tab" });
+          if (r) send("editDivider", { id: wf.id, win: wi, idx: ti, text: r.text, color: r.color, kind: "tab" });
+        } }
+       : { icon: "edit", label: "Edit name and link", action: () => editTabDialog(wf, wi, ti, t) },
+    dv ? null : { icon: "link", label: "Copy link", action: () => bulkAction("links", one) },
+    "sep",
+    { icon: "arrow", label: "Move to…", action: () => bulkAction("move", one) },
+    { icon: "copy", label: "Copy to…", action: () => bulkAction("copy", one) },
+    { icon: "dedupe", label: "Duplicate", action: async () => {
+        await send("moveTab", { from: { id: wf.id, win: wi, idx: ti }, to: { id: wf.id, win: wi, idx: ti + 1 }, copy: true });
+        toast("Duplicated the tab", undoAction);
+      } },
+    dv ? null : { icon: "divider", label: "Add a divider above", action: () => addDividerFlow(wf, wi, ti, !t.section) },
+    "sep",
+    { icon: "pin", label: t.pinned ? "Unpin tab" : "Pin tab", action: async () => {
+        await send("setTabPinned", { id: wf.id, win: wi, idx: ti, pinned: !t.pinned });
+        toast(t.pinned ? "Unpinned the tab"
+          : settings.keepPinnedTabs ? "Pinned – it now stays open in every workflow" : "Pinned the tab", undoAction);
+      } },
+    { icon: picked ? "close" : "check", label: picked ? "Deselect" : "Select", hint: "Ctrl+click", action: () => toggleTabSelected(wf, wi, ti, false) },
+    n ? { icon: "close", label: "Deselect all", hint: "Esc", action: clearSelection } : null,
+    "sep",
+    { icon: "trash", label: live ? "Close tab" : (wf.id === LOOSE ? "Delete tab" : "Remove from workflow"), danger: true,
+      action: async () => { await send("removeTab", { id: wf.id, win: wi, idx: ti }); toast(dv ? "Removed a divider" : "Removed a tab", undoAction); } }
+  ]);
 }
 
 // ---------- tips (? button, bottom-left) ----------
 const TAB_TIPS = [
   "Drag a tab to another workflow to move it – hold Ctrl while dropping to copy it",
   "Double-click a tab to open it; hover it for edit, open and remove",
-  "Tick “Select tabs” above the first tab to copy, move or remove several at once",
+  "Hover a tab’s icon and tick it to select it – then move, copy, open or delete several at once from the bar at the bottom",
+  "Drag one of the selected tabs to move them all together; right-click a tab for more",
   "Press / to search all tabs and workflows",
   "Press Ctrl+K for the command palette: find any tab, switch workflows, run commands",
   "Press Ctrl+Z to undo; History has every recent change and the trash"
@@ -637,13 +844,17 @@ function toggleHelp(force) {
 function renderRow(wf, wi, ti, t, hidden, q) {
   const live = isLive(wf);
   const label = t.name || t.title || t.url;
-  const sel = selFor(wf.id);
-  const picked = !!sel && sel.keys.has(keyOf(wi, ti));
+  const picked = isPicked(wf.id, wi, ti);
   const dv = isDividerTab(t) ? dividerOf(t.url) : null;
+  // The site icon turns into a checkbox on hover (and for every tab once any tab is ticked).
+  const check = el("input", { type: "checkbox", className: "row-check", checked: picked, tabIndex: -1,
+    title: picked ? "Deselect" : "Select (Shift+click: select a range)", "aria-label": (picked ? "Deselect " : "Select ") + (dv ? "divider" : label),
+    on: { click: e => { e.stopPropagation(); e.preventDefault(); toggleTabSelected(wf, wi, ti, e.shiftKey); },
+          dblclick: e => e.stopPropagation() } });
   const row = el("li", { className: "tab-row" + (dv ? " divider-row" : "") + (hidden ? " hide" : "") + (picked ? " picked" : ""), draggable: true,
       title: dv ? "Divider tab – sleeps when you’re not on it" : label === t.url ? t.url : `${label}\n${t.url}`, "data-idx": ti,
       "data-gcolor": dv ? dv.color : null }, dv ? [
-    sel ? el("input", { type: "checkbox", className: "row-check", checked: picked, tabIndex: -1, "aria-label": "Select divider" }) : null,
+    el("span", { className: "fav-slot div-slot" }, [check]),
     el("span", { className: "div-line" }),
     el("span", { className: "div-text" }, [highlight(dv.text || "Divider", q)]),
     el("span", { className: "div-line" }),
@@ -658,9 +869,8 @@ function renderRow(wf, wi, ti, t, hidden, q) {
         on: { click: async e => { e.stopPropagation(); await send("removeTab", { id: wf.id, win: wi, idx: ti }); toast("Removed a divider", undoAction); } } })
     ])
   ] : [
-    sel ? el("input", { type: "checkbox", className: "row-check", checked: picked, tabIndex: -1, "aria-label": "Select " + label }) : null,
     el("span", { className: "tab-num", textContent: ti + 1 }),
-    favicon(t.url, t.favIconUrl),
+    el("span", { className: "fav-slot" }, [favicon(t.url, t.favIconUrl), check]),
     el("div", { className: "tab-text" }, [
       el("span", { className: "tab-title" }, [highlight(label, q)]),
       el("span", { className: "tab-host" }, [highlight(hostOf(t.url), q)]),
@@ -678,26 +888,101 @@ function renderRow(wf, wi, ti, t, hidden, q) {
         on: { click: async e => { e.stopPropagation(); await send("removeTab", { id: wf.id, win: wi, idx: ti }); toast("Removed a tab", undoAction); } } })
     ])
   ]);
+  // While tabs are ticked, clicking a row ticks it too; Ctrl/Cmd+click ticks without selecting first.
   row.addEventListener("click", e => {
-    if (!selFor(wf.id) || e.target.closest(".row-actions")) return;
+    if (e.target.closest(".row-actions")) return;
+    if (!selection.size && !(e.ctrlKey || e.metaKey)) return;
     e.preventDefault();
     toggleTabSelected(wf, wi, ti, e.shiftKey);
   });
-  row.addEventListener("dblclick", () => { if (!selFor(wf.id)) send("focusTab", { id: wf.id, win: wi, idx: ti }); });
+  row.addEventListener("dblclick", () => { if (!selection.size) send("focusTab", { id: wf.id, win: wi, idx: ti }); });
+  row.addEventListener("contextmenu", e => tabMenu(e, wf, wi, ti, t));
   row.addEventListener("dragstart", e => {
-    dragging = { from: { id: wf.id, win: wi, idx: ti }, row };
+    // Dragging a ticked tab drags every ticked tab along with it.
+    const n = picked ? selCount() : 0;
+    const multi = n > 1;
+    dragging = { from: { id: wf.id, win: wi, idx: ti }, row, multi };
     e.dataTransfer.effectAllowed = "copyMove";
-    e.dataTransfer.setData("text/uri-list", t.url);
-    e.dataTransfer.setData("text/plain", t.url);
-    setTimeout(() => row.classList.add("dragging"), 0);
+    const urls = multi ? selectedGroups().flatMap(g => g.items.map(it => tabAt(g.wf, it))).filter(Boolean).map(x => x.url) : [t.url];
+    e.dataTransfer.setData("text/uri-list", urls.join("\r\n"));
+    e.dataTransfer.setData("text/plain", urls.join("\n"));
+    if (multi) e.dataTransfer.setDragImage(dragGhost(n), 18, 18);
+    setTimeout(() => (multi ? document.querySelectorAll(".tab-row.picked") : [row]).forEach(r => r.classList.add("dragging")), 0);
   });
   row.addEventListener("dragend", () => {
-    row.classList.remove("dragging");
+    document.querySelectorAll(".tab-row.dragging").forEach(r => r.classList.remove("dragging"));
     clearDropUi();
     dragging = null;
     if (pendingRender) { pendingRender = false; renderBoard(); }
   });
   return row;
+}
+
+// Collapse / expand: the card's height glides to its new size and the tabs fade, instead of jumping.
+function animateCollapse(card, shut) {
+  const from = card.offsetHeight;                  // mid-animation this is the animated height
+  if (card._fold) { card._fold.cancel(); card._fold = null; }
+  card.classList.toggle("collapsed", shut);
+  const to = card.offsetHeight;
+  if (from === to || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  card.classList.add("folding");                   // keeps the tabs on screen while it closes
+  const ease = "cubic-bezier(.2,.8,.2,1)";
+  const anim = card.animate([{ height: from + "px" }, { height: to + "px" }], { duration: 280, easing: ease });
+  card.querySelectorAll(":scope > .card-body, :scope > .card-foot").forEach(b =>
+    b.animate([{ opacity: shut ? 1 : 0, transform: shut ? "none" : "translateY(-6px)" },
+               { opacity: shut ? 0 : 1, transform: shut ? "translateY(-6px)" : "none" }],
+              { duration: shut ? 180 : 280, easing: ease }));
+  card._fold = anim;
+  const done = () => { if (card._fold === anim) { card._fold = null; card.classList.remove("folding"); } };
+  anim.onfinish = done;
+  anim.oncancel = () => card.classList.remove("folding");
+}
+
+// "Keep pinned tabs open": the pinned tabs aren't saved in any workflow but stay open in all of them,
+// so every workflow shows them at the top (dimmed, not draggable). Right-click for Unpin / Close.
+function sharedPinsBlock(q) {
+  if (!settings.keepPinnedTabs) return null;
+  const pins = (state.pinnedTabs || []).filter(p => !q || ((p.title || "") + " " + p.url).toLowerCase().includes(q));
+  if (!pins.length) return null;
+  const rows = pins.map(p => {
+    const label = p.title || p.url;
+    const row = el("li", { className: "tab-row shared-pin", title: `${label}\n${p.url}\nPinned – stays open in every workflow` }, [
+      el("span", { className: "fav-slot" }, [favicon(p.url, p.favIconUrl)]),
+      el("div", { className: "tab-text" }, [
+        el("span", { className: "tab-title" }, [highlight(label, q)]),
+        el("span", { className: "tab-host" }, [highlight(hostOf(p.url), q)]),
+        el("span", { className: "tab-url" }, [highlight(p.url, q)])
+      ]),
+      el("span", { className: "pin", html: svgIcon("pin", 13) }),
+      el("div", { className: "row-actions" }, [
+        el("button", { title: "Unpin – it becomes a normal tab of the workflow you’re in", html: svgIcon("pin", 13),
+          on: { click: e => { e.stopPropagation(); send("unpinShared", { url: p.url }); } } }),
+        el("button", { title: "Go to this tab", html: svgIcon("external", 13),
+          on: { click: e => { e.stopPropagation(); send("focusPinned", { url: p.url }); } } }),
+        el("button", { className: "rm", title: "Close this pinned tab", html: svgIcon("close", 13),
+          on: { click: e => { e.stopPropagation(); send("closeShared", { url: p.url }); } } })
+      ])
+    ]);
+    row.addEventListener("dblclick", () => send("focusPinned", { url: p.url }));
+    row.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      openMenuAt(e.clientX, e.clientY, [
+        { heading: "Pinned in every workflow" },
+        { icon: "external", label: "Go to tab", action: () => send("focusPinned", { url: p.url }) },
+        { icon: "link", label: "Copy link", action: async () => {
+            try { await navigator.clipboard.writeText(p.url); toast("Copied the link"); } catch (_) { toast("Couldn’t access the clipboard"); }
+          } },
+        "sep",
+        { icon: "pin", label: "Unpin tab", action: () => { send("unpinShared", { url: p.url }); toast("Unpinned – it’s now a tab of the workflow you’re in"); } },
+        { icon: "close", label: "Close tab", danger: true, action: () => send("closeShared", { url: p.url }) }
+      ]);
+    });
+    return row;
+  });
+  return el("div", { className: "shared-pins" }, [
+    el("div", { className: "win-label", html: svgIcon("pin", 11) + "<span>Pinned · in every workflow</span>" }),
+    el("ul", { className: "tab-list" }, rows)
+  ]);
 }
 
 function renderCard(wf, i) {
@@ -710,8 +995,7 @@ function renderCard(wf, i) {
 
   const loose = wf.id === LOOSE;
   const card = el("article", {
-    className: "card" + (active ? " active" : "") + (isCollapsed ? " collapsed" : "") + (loose ? " loose" : "")
-      + (selFor(wf.id) ? " selecting" : ""),
+    className: "card" + (active ? " active" : "") + (isCollapsed ? " collapsed" : "") + (loose ? " loose" : ""),
     style: `--i:${i}`, "data-id": wf.id, "data-color": wf.color || null
   });
 
@@ -725,19 +1009,20 @@ function renderCard(wf, i) {
 
   const collapseBtn = el("button", { className: "iconbtn flat collapse", title: isCollapsed ? "Expand" : "Collapse", html: svgIcon("chevron", 16),
     on: { click: () => {
-      collapsed.has(wf.id) ? collapsed.delete(wf.id) : collapsed.add(wf.id);
+      const shut = !collapsed.has(wf.id);
+      shut ? collapsed.add(wf.id) : collapsed.delete(wf.id);
       writeLocal("tm-collapsed", [...collapsed]);
-      card.classList.toggle("collapsed");
+      collapseBtn.title = shut ? "Expand" : "Collapse";
+      animateCollapse(card, shut);
     } } });
 
-  const picking = !!selFor(wf.id) && selFor(wf.id).keys.size > 0;
   const head = loose ? el("div", { className: "card-head" }, [
     el("div", { className: "tile", html: svgIcon("list", 19) }),
     el("div", { className: "card-title" }, [
       el("div", { className: "card-name" }, [highlight(wf.name, q)]),
       el("div", { className: "card-meta", textContent: `${plural(tabsN, "tab")} · not in any workflow` })
     ]),
-    picking ? selectionActions(wf) : el("div", { className: "card-actions" }, [
+    el("div", { className: "card-actions" }, [
       el("button", { className: "iconbtn flat", title: "New tab", html: svgIcon("plus", 16), on: { click: () => newTabDialog(LOOSE) } }),
       tabsN ? el("button", { className: "iconbtn flat danger", title: "Delete all unsorted tabs", html: svgIcon("trash", 15),
         on: { click: async () => {
@@ -752,7 +1037,7 @@ function renderCard(wf, i) {
       el("div", { className: "card-name", title: "Double-click to rename", on: { dblclick: () => editWorkflow(wf) } }, [highlight(wf.name, q)]),
       meta
     ]),
-    picking ? selectionActions(wf) : el("div", { className: "card-actions" }, [
+    el("div", { className: "card-actions" }, [
       (() => {
         const showOnly = active && settings.switchMode === "windows" && !isFocused(wf);
         const off = active && !showOnly;
@@ -770,7 +1055,7 @@ function renderCard(wf, i) {
 
   let matches = 0;
   const body = el("div", { className: "card-body" });
-  if (tabsN) body.append(selectBar(wf, tabsN));
+  if (!loose) { const pins = sharedPinsBlock(q); if (pins) body.append(pins); }
   windows.forEach((w, wi) => {
     if (windows.length > 1) body.append(el("div", { className: "win-label", textContent: `Window ${wi + 1}` }));
     const ul = el("ul", { className: "tab-list" + (w.tabs.length ? "" : " empty-list"), "data-id": wf.id, "data-win": wi });
@@ -835,6 +1120,8 @@ function renderBoard() {
   const canvasMode = settings.display === "canvas";
   if (canvasMode && !canvasLoaded) { loadCanvas().then(renderBoard); return; }
   if (dragging || movingCard) { pendingRender = true; return; }
+  pruneSelection();
+  renderSelBar();
   const board = $("board");
   board.innerHTML = "";
   board.removeAttribute("style");
@@ -984,6 +1271,14 @@ async function settingsPageContent(id, section) {
       row("Save memory after switching", "Background tabs finish loading and are then put to sleep until you click them. Tabs are never interrupted while loading, and a tab that’s stuck when you open it is reloaded.", switchCtl("lazyLoad")),
       row("Ask before switching", "Always confirm before closing your tabs to open another workflow. You’re always asked when unsaved tabs would be lost.", switchCtl("confirmSwitch")),
       row("Keep this page open", "Re-open the Session Manager after switching workflows.", switchCtl("keepManagerOpen"))
+    ]), section("Pinned tabs", [
+      row("Keep pinned tabs open", "Pinned tabs belong to no workflow: switching only closes and opens your normal tabs, and pinned tabs stay where they are. Unpin a tab to make it part of the workflow you’re in.",
+        switchCtl("keepPinnedTabs")),
+      settings.keepPinnedTabs ? row("Pinned tabs and windows",
+        "Stay in their window: pinned tabs stay where they are. Copy into every workflow: each workflow you open in a new window gets your pinned tabs. Copy into every window: every new browser window gets them, also ones you open yourself. On all your browsers: every window, and the same pinned tabs on your other browsers too (needs sync in Settings → Sync). Tabs you pin later are included from then on.",
+        selectCtl("pinnedScope", [["window", "Stay in their window"], ["workflow", "Copy into every workflow"], ["every", "Copy into every window"], ["sync", "Every window, on all your browsers"]])) : null,
+      settings.keepPinnedTabs ? row("Workflows with pinned tabs saved in them", "Workflows saved before this was on can still have pinned tabs in them. When you open one: ask each time, pin them (they then stay open like your other pinned tabs), open them as normal tabs, or remove them from the workflow.",
+        selectCtl("pinnedOnOpen", [["ask", "Ask me"], ["pin", "Pin them"], ["unpin", "Open as normal tabs"], ["remove", "Remove them"]])) : null
     ]), section("Dividers", [
       row("Put divider tabs to sleep", "Divider tabs are put to sleep whenever you’re on another tab, so they use almost no memory. Clicking one wakes it up instantly.", switchCtl("dividerSleep")),
       row("Insert a divider tab", "Adds a divider right after the tab you’re on – also from the divider button in the popup. Click the shortcut to change it on the browser’s shortcuts page.",
@@ -1771,7 +2066,8 @@ function layoutCanvas(cards) {
     c.style.top = p.y + "px";
     c.style.zIndex = p.z || 1;
     if (p.w) c.style.width = p.w + "px";
-    if (p.h) c.style.height = p.h + "px";
+    // A height you dragged is the most it grows to: with fewer tabs it shrinks to fit, so no empty gap.
+    if (p.h) c.style.maxHeight = p.h + "px";
   };
   const placed = cards.filter(c => canvas.pos[c.dataset.id]);
   const unplaced = cards.filter(c => !canvas.pos[c.dataset.id]);
@@ -2054,7 +2350,7 @@ function enableCardResize(card) {
         const p = canvas.pos[card.dataset.id];
         if (!p) return;
         delete p.w; delete p.h;
-        card.style.width = ""; card.style.height = "";
+        card.style.width = ""; card.style.height = ""; card.style.maxHeight = "";
         saveCanvas();
       } else if (settings.display === "board") {
         applyBoardWidth(320);
@@ -2104,6 +2400,7 @@ function enableCardResize(card) {
           p.h = hgt;
           if (dir.includes("n")) p.y = Math.round(oy + (oh - hgt));
           card.style.height = hgt + "px";
+          card.style.maxHeight = hgt + "px";
           card.style.top = p.y + "px";
         }
         pushNeighbours({ x: p.x, y: p.y, w: card.offsetWidth, h: card.offsetHeight }, others, dir);
@@ -2115,8 +2412,16 @@ function enableCardResize(card) {
         card.classList.remove("resizing");
         document.body.className = document.body.className.replace(/\bresizing-\w+\b/g, "").trim();
         movingCard = false;
-        if (mode === "canvas") saveCanvas();
-        else setSetting("boardWidth", boardW);
+        if (mode === "canvas") {
+          // Let go: the card fits its tabs again, up to the height you dragged (keep the bottom edge put when
+          // dragging the top edge further than the tabs need).
+          if (card.style.height) {
+            card.style.height = "";
+            const real = card.offsetHeight;
+            if (dir.includes("n") && p.h && real < p.h) { p.y += p.h - real; card.style.top = p.y + "px"; }
+          }
+          saveCanvas();
+        } else setSetting("boardWidth", boardW);
         if (pendingRender) { pendingRender = false; renderBoard(); }
       };
       window.addEventListener("pointermove", move);
@@ -2652,9 +2957,10 @@ function renderDisplaySeg() {
 
 // ---------- data ----------
 async function load() {
-  const data = await chrome.storage.local.get(["workflows", "activeWorkflowId", "looseTabs", "openWindows"]);
+  const data = await chrome.storage.local.get(["workflows", "activeWorkflowId", "looseTabs", "openWindows", "pinnedTabs"]);
   state = { workflows: data.workflows || {}, activeWorkflowId: data.activeWorkflowId || null,
-            looseTabs: data.looseTabs || [], openWindows: data.openWindows || {} };
+            looseTabs: data.looseTabs || [], openWindows: data.openWindows || {},
+            pinnedTabs: (data.pinnedTabs && data.pinnedTabs.tabs) || [] };
   refreshTagFilter();
   renderBoard();
 }
@@ -2674,7 +2980,7 @@ document.addEventListener("pointercancel", settingsPointerUp, true);
 
 chrome.storage.onChanged.addListener((ch, area) => {
   if (area !== "local") return;
-  if (ch.workflows || ch.activeWorkflowId || ch.looseTabs || ch.openWindows) load();
+  if (ch.workflows || ch.activeWorkflowId || ch.looseTabs || ch.openWindows || ch.pinnedTabs) load();
   if (ch.history) updateUndoBtn();
   if ((ch.history || ch.trash || ch.groupCopies) && !$("historyView").classList.contains("hidden")) renderHistory();
   const typingInSettings = $("settings").contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName);
@@ -2752,7 +3058,7 @@ document.addEventListener("keydown", e => {
     if (!$("modal").classList.contains("hidden")) { $("modal")._cancel && $("modal")._cancel(); return; }
     if (!$("menu").classList.contains("hidden")) { closeMenu(); return; }
     if ($("helpPop") && !$("helpPop").classList.contains("hidden")) { toggleHelp(false); return; }
-    if (selection.size) { selection.clear(); renderBoard(); return; }
+    if (selection.size) { clearSelection(); return; }
     if (document.activeElement === $("search") && query) { $("search").value = ""; query = ""; renderBoard(); }
   }
   if (combo && combo === hk.search && (combo.includes("+") || !typing) && $("modal").classList.contains("hidden")) {
